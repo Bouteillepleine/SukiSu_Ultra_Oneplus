@@ -139,7 +139,7 @@ jobs:
 
       - name: Build Kernel
         id: build
-        uses: ./.github/actions/
+        uses: ./.github/actions/action
         with:
           model: ${{ steps.config.outputs.model }}
           soc: ${{ steps.config.outputs.soc }}
