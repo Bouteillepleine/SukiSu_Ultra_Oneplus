@@ -1,4 +1,4 @@
-name: Build OnePlus Kernels - All Devices
+name: Build OnePlus Kernels_All
 
 concurrency:
   group: build-${{ github.ref }}
@@ -12,16 +12,16 @@ on:
   workflow_dispatch:
     inputs:
       make_release:
-        description: 'Create release after build?'
+        description: 'Create release?'
         type: boolean
         default: false
       optimize_level:
-        description: 'Compiler optimization level'
+        description: 'Compiler optimization'
         type: choice
         options: [O2, O3]
         default: O2
       KSU_META:
-        description: 'SukiSU Ultra metadata (branch/tag/hash)'
+        description: 'SukiSU Ultra metadata'
         default: 'susfs-main/⚡Ultra⚡/'
       HOOK:
         description: 'Hook type'
@@ -29,24 +29,25 @@ on:
         options: [kprobe, manual, tracepoint]
         default: manual
       LSM:
-        description: 'Enable Baseband Guard LSM?'
+        description: 'Enable Baseband Guard?'
         type: boolean
         default: false
       susfs_branch:
-        description: 'SUSFS branch (leave empty for auto-detect)'
+        description: 'SUSFS branch (auto if empty)'
         default: ''
 
 env:
   BUILD_DATE: ${{ github.run_number }}
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
 
 jobs:
   build:
-    name: Build ${{ matrix.config }}
+    name: ${{ matrix.config }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     strategy:
       fail-fast: false
-      max-parallel: 5
+      max-parallel: 20
       matrix:
         config:
           - oneplus_nord_4_v
@@ -74,79 +75,71 @@ jobs:
         uses: easimon/maximize-build-space@master
         with:
           root-reserve-mb: 8192
-          swap-size-mb: 2048
-          remove-dotnet: 'true'
-          remove-android: 'true'
-          remove-haskell: 'true'
-          remove-codeql: 'true'
-          remove-docker-images: 'true'
+          swap-size-mb: 4096
+          remove-dotnet: true
+          remove-android: true
+          remove-haskell: true
+          remove-codeql: true
+          remove-docker-images: true
 
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Load Device Configuration
+      - name: Setup Build Environment
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -yqq jq ccache
+
+      - name: Cache Build Tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            /usr/local/bin/repo
+            ${{ env.CCACHE_DIR }}
+          key: build-tools-${{ runner.os }}-${{ hashFiles('.github/**') }}
+          restore-keys: |
+            build-tools-${{ runner.os }}-
+
+      - name: Cache Kernel Source
+        id: cache-source
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ matrix.config }}/kernel_platform
+            ${{ matrix.config }}/.repo
+          key: kernel-source-${{ matrix.config }}-${{ github.sha }}
+          restore-keys: |
+            kernel-source-${{ matrix.config }}-
+
+      - name: Load Device Config
         id: config
         run: |
-          set -euo pipefail
+          CONFIG_FILE=".github/device_map.json"
+          DEVICE="${{ matrix.config }}"
           
-          CONFIG_FILE="configs/${{ matrix.config }}.json"
-          
-          echo "::group::Loading config for ${{ matrix.config }}"
-          
-          if [ ! -f "$CONFIG_FILE" ]; then
-            echo "::error::Config file not found: $CONFIG_FILE"
-            echo "Available configs:"
-            ls -1 configs/*.json 2>/dev/null || echo "No configs found"
+          if ! jq -e --arg k "$DEVICE" 'has($k)' "$CONFIG_FILE" >/dev/null; then
+            echo "::error::Device '$DEVICE' not found in $CONFIG_FILE"
             exit 1
           fi
           
-          # Validate JSON
-          if ! jq empty "$CONFIG_FILE" 2>/dev/null; then
-            echo "::error::Invalid JSON in $CONFIG_FILE"
-            exit 1
-          fi
+          echo "Loading config for $DEVICE..."
+          jq -r --arg k "$DEVICE" '.[$k] | to_entries[] | "\(.key)=\(.value)"' \
+            "$CONFIG_FILE" | tee -a "$GITHUB_OUTPUT"
           
-          # Extract values
-          MODEL=$(jq -r '.model // empty' "$CONFIG_FILE")
-          SOC=$(jq -r '.soc // empty' "$CONFIG_FILE")
-          BRANCH=$(jq -r '.branch // empty' "$CONFIG_FILE")
-          MANIFEST=$(jq -r '.manifest // empty' "$CONFIG_FILE")
-          ANDROID_VERSION=$(jq -r '.android_version // empty' "$CONFIG_FILE")
-          KERNEL_VERSION=$(jq -r '.kernel_version // empty' "$CONFIG_FILE")
-          
-          # Validate required fields
-          for var in MODEL SOC BRANCH MANIFEST ANDROID_VERSION KERNEL_VERSION; do
-            val="${!var}"
-            if [ -z "$val" ]; then
-              echo "::error::Missing required field: $var in $CONFIG_FILE"
-              cat "$CONFIG_FILE"
+          # Verify required fields
+          for field in model soc branch manifest android_version kernel_version; do
+            if ! grep -q "^${field}=" "$GITHUB_OUTPUT"; then
+              echo "::error::Missing required field: $field"
               exit 1
             fi
           done
-          
-          # Output values
-          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
-          echo "soc=$SOC" >> "$GITHUB_OUTPUT"
-          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-          echo "manifest=$MANIFEST" >> "$GITHUB_OUTPUT"
-          echo "android_version=$ANDROID_VERSION" >> "$GITHUB_OUTPUT"
-          echo "kernel_version=$KERNEL_VERSION" >> "$GITHUB_OUTPUT"
-          
-          echo "✅ Configuration loaded:"
-          echo "  Model: $MODEL"
-          echo "  SoC: $SOC"
-          echo "  Branch: $BRANCH"
-          echo "  Manifest: $MANIFEST"
-          echo "  Android: $ANDROID_VERSION"
-          echo "  Kernel: $KERNEL_VERSION"
-          
-          echo "::endgroup::"
 
       - name: Build Kernel
         id: build
-        uses: ./.github/actions/build-kernel
+        uses: ./.github/actions/
         with:
           model: ${{ steps.config.outputs.model }}
           soc: ${{ steps.config.outputs.soc }}
@@ -154,251 +147,355 @@ jobs:
           manifest: ${{ steps.config.outputs.manifest }}
           android_version: ${{ steps.config.outputs.android_version }}
           kernel_version: ${{ steps.config.outputs.kernel_version }}
-          ksun_branch: 'stable'
-          susfs_branch: ${{ github.event.inputs.susfs_branch }}
-          KSU_META: ${{ github.event.inputs.KSU_META }}
-          HOOK: ${{ github.event.inputs.HOOK }}
-          LSM: ${{ github.event.inputs.LSM }}
-          optimize_level: ${{ github.event.inputs.optimize_level }}
+          susfs_branch: ${{ inputs.susfs_branch }}
+          KSU_META: ${{ inputs.KSU_META }}
+          HOOK: ${{ inputs.HOOK }}
+          LSM: ${{ inputs.LSM }}
+          optimize_level: ${{ inputs.optimize_level }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: false
 
-      - name: Save Build Metadata
-        if: success()
-        run: |
-          mkdir -p build-metadata
-          cat > "build-metadata/${{ matrix.config }}.json" << EOF
-          {
-            "device": "${{ matrix.config }}",
-            "model": "${{ steps.config.outputs.model }}",
-            "soc": "${{ steps.config.outputs.soc }}",
-            "android_version": "${{ steps.config.outputs.android_version }}",
-            "kernel_version": "${{ steps.build.outputs.kernel_version }}",
-            "ksu_version": "${{ steps.build.outputs.ksu_version }}",
-            "susfs_version": "${{ steps.build.outputs.susfs_version }}",
-            "package_name": "${{ steps.build.outputs.filename }}",
-            "package_size": "${{ steps.build.outputs.package_size }}",
-            "sha256": "${{ steps.build.outputs.image_sha256 }}",
-            "hook_type": "${{ github.event.inputs.HOOK }}",
-            "optimize_level": "${{ github.event.inputs.optimize_level }}",
-            "lsm_enabled": "${{ github.event.inputs.LSM }}",
-            "build_date": "$(date -u +%Y-%m-%d)",
-            "build_number": "${{ github.run_number }}"
-          }
-          EOF
-
-      - name: Upload Build Metadata
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: metadata-${{ matrix.config }}
-          path: build-metadata/${{ matrix.config }}.json
-          retention-days: 7
-
-      - name: Build Summary
+      - name: Generate Build Summary
         if: always()
         run: |
           if [ "${{ steps.build.outcome }}" = "success" ]; then
-            echo "## ✅ ${{ matrix.config }} - Build Success" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-            echo "| **Kernel Version** | \`${{ steps.build.outputs.kernel_version }}\` |" >> $GITHUB_STEP_SUMMARY
-            echo "| **KernelSU** | \`${{ steps.build.outputs.ksu_version }}\` |" >> $GITHUB_STEP_SUMMARY
-            echo "| **SUSFS** | \`${{ steps.build.outputs.susfs_version }}\` |" >> $GITHUB_STEP_SUMMARY
-            echo "| **Package** | \`${{ steps.build.outputs.filename }}\` |" >> $GITHUB_STEP_SUMMARY
-            echo "| **Size** | \`${{ steps.build.outputs.package_size }}MB\` |" >> $GITHUB_STEP_SUMMARY
-            echo "| **Artifact** | \`${{ steps.build.outputs.artifact_name }}\` |" >> $GITHUB_STEP_SUMMARY
-            echo "| **SHA256** | \`${{ steps.build.outputs.image_sha256 }}\` |" >> $GITHUB_STEP_SUMMARY
+            cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## ✅ ${{ matrix.config }} - Build Success
+          
+          - **Kernel:** \`${{ steps.build.outputs.kernel_version }}\`
+          - **KSU:** \`${{ steps.build.outputs.ksu_version }}\`
+          - **Package:** \`${{ steps.build.outputs.package_name }}.zip\`
+          - **Size:** \`${{ steps.build.outputs.package_size }}MB\`
+          - **Hook:** ${{ inputs.HOOK }}
+          - **Optimization:** ${{ inputs.optimize_level }}
+          EOF
           else
-            echo "## ❌ ${{ matrix.config }} - Build Failed" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "Check the logs for details." >> $GITHUB_STEP_SUMMARY
+            cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## ❌ ${{ matrix.config }} - Build Failed
+          
+          Check logs for details.
+          EOF
           fi
 
-  create-release:
-    name: Create GitHub Release
-    needs: [build]
+      - name: Upload Logs on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.config }}
+          path: |
+            ${{ steps.config.outputs.model }}/kernel_platform/common/build.log
+            ${{ steps.config.outputs.model }}/kernel_platform/common/out/.config
+            ${{ steps.config.outputs.model }}/kernel_platform/common/out/error.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+  release:
+    needs: build
+    if: inputs.make_release && !cancelled()
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.make_release == 'true' && !cancelled() }}
-    permissions:
-      contents: write
-    
+    timeout-minutes: 30
+
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download All Artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: kernel-*  # ✅ Match new artifact naming pattern
+          merge-multiple: false
 
-      - name: List Downloaded Artifacts
+      - name: Extract and Flatten Artifacts
         run: |
-          echo "::group::Downloaded artifacts"
-          find artifacts -type f | sort
-          echo "::endgroup::"
-
-      - name: Organize Release Files
-        run: |
-          mkdir -p release-files
+          set -euo pipefail
           
-          # Find and copy all kernel packages
-          find artifacts -name "*.zip" -type f | while read file; do
-            if [[ "$(basename "$file")" == AnyKernel3_* ]]; then
-              cp "$file" release-files/
-              echo "Added: $(basename "$file")"
-            fi
+          echo "::group::Extracting artifacts"
+          
+          # Create flat directory for ZIPs
+          mkdir -p release
+          
+          # Find all kernel packages (they're in subdirectories)
+          find artifacts -type f -name "*.zip" | while read -r zip_path; do
+            filename=$(basename "$zip_path")
+            echo "Found: $filename"
+            
+            # Copy to release directory
+            cp "$zip_path" "release/$filename"
           done
           
-          echo ""
-          echo "Release files:"
-          ls -lh release-files/
-
-      - name: Generate Release Notes
-        run: |
-          cat > release_notes.md << 'EOFNOTES'
-          # 🚀 OnePlus Kernels with SukiSU Ultra
+          cd release
           
-          ## 📱 Available Builds
+          # Verify we have files
+          ZIP_COUNT=$(ls -1 *.zip 2>/dev/null | wc -l)
           
-          | Device | Kernel | Android | SoC | Package Size |
-          |--------|--------|---------|-----|--------------|
-          EOFNOTES
-          
-          # Process metadata files
-          for meta_file in $(find artifacts -name "*.json" -path "*/metadata-*/*" -type f 2>/dev/null | sort); do
-            if [ -f "$meta_file" ]; then
-              device=$(jq -r '.device // "unknown"' "$meta_file")
-              kernel=$(jq -r '.kernel_version // "unknown"' "$meta_file")
-              android=$(jq -r '.android_version // "unknown"' "$meta_file")
-              soc=$(jq -r '.soc // "unknown"' "$meta_file")
-              size=$(jq -r '.package_size // "unknown"' "$meta_file")
-              
-              printf "| %s | \`%s\` | %s | %s | %sMB |\n" \
-                "$device" "$kernel" "$android" "$soc" "$size" >> release_notes.md
-            fi
-          done
-          
-          cat << 'EOFNOTES' >> release_notes.md
-          
-          ## ✨ What's Included
-          
-          - ✅ **SukiSU Ultra** integrated (KernelSU fork)
-          - 🛡️ **SUSFS 1.5.12** for advanced root hiding
-          - 🔒 **WireGuard** VPN support built-in
-          - 🚄 **BBR** TCP congestion control
-          - ⚡ Compiler optimization: **${{ github.event.inputs.optimize_level }}**
-          - 🎯 Hook type: **${{ github.event.inputs.HOOK }}**
-          EOFNOTES
-          
-          if [ "${{ github.event.inputs.LSM }}" = "true" ]; then
-            echo "- 🔐 **Baseband Guard LSM** enabled" >> release_notes.md
-          fi
-          
-          cat << 'EOFNOTES' >> release_notes.md
-          
-          ## 📦 Installation Instructions
-          
-          1. **Download** the zip file matching your device model
-          2. **Boot** into custom recovery (TWRP/OrangeFox)
-          3. **Flash** the downloaded zip
-          4. **Reboot** your device
-          5. **Install** SukiSU Manager from [releases](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)
-          
-          ## ⚠️ Important Notes
-          
-          - ⚡ **Backup your data** before flashing
-          - 📱 Verify your device model matches the filename
-          - 🔍 Check Android version compatibility
-          - 📲 SukiSU Manager is **required** for root management
-          - 🛡️ SUSFS module can be installed separately for enhanced hiding
-          
-          ## 🔧 Build Configuration
-          
-          - **Build Number:** `${{ github.run_number }}`
-          - **Build Date:** `$(date -u +"%Y-%m-%d %H:%M UTC")`
-          - **Optimization:** `${{ github.event.inputs.optimize_level }}`
-          - **Hook Type:** `${{ github.event.inputs.HOOK }}`
-          - **LSM Enabled:** `${{ github.event.inputs.LSM }}`
-          
-          ## 🔗 Useful Links
-          
-          - **SukiSU Ultra:** https://github.com/SukiSU-Ultra/SukiSU-Ultra
-          - **SUSFS Module:** https://github.com/sidex15/ksu_module_susfs
-          - **Report Issues:** https://github.com/${{ github.repository }}/issues
-          - **Source Code:** https://github.com/${{ github.repository }}
-          
-          ## 📝 Changelog
-          
-          - Updated to latest kernel sources
-          - Integrated latest KernelSU patches
-          - SUSFS 1.5.12 compatibility
-          - Performance optimizations
-          - Security enhancements
-          
-          ---
-          
-          **⚠️ Disclaimer:** Use at your own risk. Always backup your data before flashing custom kernels.
-          EOFNOTES
-          
-          echo "::group::Release Notes"
-          cat release_notes.md
-          echo "::endgroup::"
-
-      - name: Verify Release Files
-        run: |
-          file_count=$(find release-files -name "*.zip" -type f | wc -l)
-          
-          if [ "$file_count" -eq 0 ]; then
-            echo "::error::No kernel packages found for release"
-            echo "Artifacts structure:"
-            find artifacts -type f
+          if [ "$ZIP_COUNT" -eq 0 ]; then
+            echo "::error::No kernel packages found!"
+            echo "::group::Artifacts structure"
+            ls -lR ../artifacts/
+            echo "::endgroup::"
             exit 1
           fi
           
-          echo "Found $file_count kernel package(s) for release"
+          echo "✅ Extracted $ZIP_COUNT kernel packages"
+          ls -lh *.zip
+          
+          echo "::endgroup::"
+
+      - name: Verify Artifacts
+        run: |
+          cd release
+          
+          echo "::group::Verifying kernel packages"
+          
+          FAILED=0
+          
+          for zip in *.zip; do
+            echo "Checking $zip..."
+            
+            # Test ZIP integrity
+            if ! unzip -t "$zip" >/dev/null 2>&1; then
+              echo "::error::Corrupted ZIP: $zip"
+              FAILED=1
+              continue
+            fi
+            
+            # Verify kernel Image exists
+            if ! unzip -l "$zip" | grep -q "^.*Image$"; then
+              echo "::error::Missing kernel Image in $zip"
+              echo "::group::Contents of $zip"
+              unzip -l "$zip"
+              echo "::endgroup::"
+              FAILED=1
+              continue
+            fi
+            
+            # Check for nested ZIPs (should not exist after fix)
+            if unzip -l "$zip" | grep -q "\.zip$"; then
+              echo "::warning::Nested ZIP detected in $zip"
+              echo "::group::Nested content"
+              unzip -l "$zip" | grep "\.zip$"
+              echo "::endgroup::"
+            fi
+            
+            # Verify anykernel.sh exists
+            if ! unzip -l "$zip" | grep -q "anykernel.sh"; then
+              echo "::error::Missing anykernel.sh in $zip"
+              FAILED=1
+              continue
+            fi
+            
+            echo "✅ $zip verified"
+          done
+          
+          echo "::endgroup::"
+          
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::Some packages failed verification!"
+            exit 1
+          fi
+          
+          echo "✅ All $ZIP_COUNT packages verified successfully"
+
+      - name: Prepare Release
+        id: prepare
+        run: |
+          set -euo pipefail
+          
+          cd release
+          
+          # Generate tag
+          TAG="v1.5.12-r$(($(git tag -l "v1.5.12-r*" 2>/dev/null | wc -l) + 1))"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          
+          # Count packages
+          COUNT=$(ls -1 *.zip 2>/dev/null | wc -l)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::No packages found for release!"
+            exit 1
+          fi
+          
+          echo "✅ Prepared $COUNT kernel packages for release"
+          
+          # Generate checksums
+          sha256sum *.zip | tee SHA256SUMS.txt
+          
+          # Calculate total size
+          TOTAL_SIZE=$(du -sh . | awk '{print $1}')
+          echo "size=$TOTAL_SIZE" >> "$GITHUB_OUTPUT"
+          
+          # List packages with details
+          echo "::group::Release packages"
+          ls -lh *.zip
+          echo ""
+          echo "SHA256 Checksums:"
+          cat SHA256SUMS.txt
+          echo "::endgroup::"
+
+      - name: Generate Release Notes
+        run: |
+          cat > release/RELEASE_NOTES.md << 'EOF'
+          # 🚀 OnePlus Kernels Build - ${{ steps.prepare.outputs.tag }}
+          
+          ## 📦 Build Information
+          
+          | Parameter | Value |
+          |-----------|-------|
+          | **Hook Type** | `${{ inputs.HOOK }}` |
+          | **Optimization** | `${{ inputs.optimize_level }}` |
+          | **LSM Enabled** | `${{ inputs.LSM }}` |
+          | **SUSFS Branch** | `${{ inputs.susfs_branch || 'auto' }}` |
+          | **Devices Built** | ${{ steps.prepare.outputs.count }} |
+          | **Total Size** | ${{ steps.prepare.outputs.size }} |
+          | **Build Date** | `$(date -u '+%Y-%m-%d %H:%M:%S UTC')` |
+          | **Commit** | `${{ github.sha }}` |
+          | **Build Number** | `#${{ github.run_number }}` |
+          
+          ## 📱 Supported Devices
+          
+          <details>
+          <summary>Click to expand device list (${{ steps.prepare.outputs.count }} devices)</summary>
+          
+          $(cd release && ls -1 *.zip | sed 's/AnyKernel3_//;s/_android[0-9]*-.*_SukiSU_.*\.zip//' | sort -u | awk '{print "- " $0}')
+          
+          </details>
+          
+          ## 🔐 SHA256 Checksums
+          
+          <details>
+          <summary>Click to verify checksums</summary>
+          
+          ```
+          $(cat release/SHA256SUMS.txt)
+          ```
+          
+          </details>
+          
+          ## 📥 Installation
+          
+          1. Download the zip file for your device
+          2. Flash the AK3 file with Kernel Flasher / SukiSU Manager
+          3. Reboot and enjoy!
+          
+          ## ⚠️ Notes
+          
+          - **Backup your data** before flashing
+          - This is a pre-release build for testing
+          - Report issues on [GitHub Issues](https://github.com/${{ github.repository }}/issues)
+          
+          ## 🔧 Build Configuration
+          
+          - **Compiler Optimization:** ${{ inputs.optimize_level }}
+          - **Hook Method:** ${{ inputs.HOOK }}
+          - **Baseband Guard (LSM):** ${{ inputs.LSM && 'Enabled' || 'Disabled' }}
+          - **SUSFS Branch:** ${{ inputs.susfs_branch || 'Auto-detected' }}
+          - **KSU Metadata:** ${{ inputs.KSU_META }}
+          
+          ---
+          
+          **Built with ❤️ by GitHub Actions**
+          
+          EOF
+
+      - name: Create Git Tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.prepare.outputs.tag }}"
+          git push origin "${{ steps.prepare.outputs.tag }}"
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.run_number }}
-          name: OnePlus Kernels - Build ${{ github.run_number }}
-          body_path: release_notes.md
-          files: release-files/*.zip
-          draft: false
-          prerelease: false
-          fail_on_unmatched_files: true
-          generate_release_notes: false
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd release
+          
+          # Verify required files exist
+          if [ ! -f SHA256SUMS.txt ]; then
+            echo "::error::Missing SHA256SUMS.txt!"
+            ls -la
+            exit 1
+          fi
+          
+          if [ ! -f RELEASE_NOTES.md ]; then
+            echo "::error::Missing RELEASE_NOTES.md!"
+            ls -la
+            exit 1
+          fi
+          
+          # Count ZIPs
+          ZIP_COUNT=$(ls -1 *.zip 2>/dev/null | wc -l)
+          if [ "$ZIP_COUNT" -eq 0 ]; then
+            echo "::error::No kernel packages to release!"
+            exit 1
+          fi
+          
+          echo "Creating release with $ZIP_COUNT packages..."
+          
+          # Create release with all files
+          gh release create "${{ steps.prepare.outputs.tag }}" \
+            --title "OnePlus Kernels ${{ steps.prepare.outputs.tag }} ($ZIP_COUNT devices)" \
+            --notes-file RELEASE_NOTES.md \
+            --prerelease \
+            *.zip SHA256SUMS.txt
+          
+          echo "✅ Release created successfully!"
+
+      - name: Cleanup Old Releases
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "::group::Cleaning up old releases"
+          
+          # Keep only last 5 pre-releases
+          OLD_RELEASES=$(gh release list --limit 100 --json tagName,isPrerelease \
+            --jq '.[] | select(.isPrerelease) | .tagName' | tail -n +6)
+          
+          if [ -z "$OLD_RELEASES" ]; then
+            echo "No old releases to clean up"
+          else
+            echo "$OLD_RELEASES" | while read tag; do
+              echo "Deleting old release: $tag"
+              gh release delete "$tag" --yes --cleanup-tag || echo "Failed to delete $tag"
+            done
+          fi
+          
+          echo "::endgroup::"
 
       - name: Release Summary
         if: success()
         run: |
-          echo "## 🎉 Release Created Successfully" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Tag:** \`build-${{ github.run_number }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**URL:** https://github.com/${{ github.repository }}/releases/tag/build-${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📦 Included Kernels" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          # 🎉 Release Created Successfully!
           
-          count=$(find release-files -name "*.zip" -type f | wc -l)
-          total_size=$(du -sh release-files | cut -f1)
+          ## Release: [${{ steps.prepare.outputs.tag }}](https://github.com/${{ github.repository }}/releases/tag/${{ steps.prepare.outputs.tag }})
           
-          echo "- **Total Packages:** $count" >> $GITHUB_STEP_SUMMARY
-          echo "- **Total Size:** $total_size" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📋 Package List" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          ### 📊 Statistics
           
-          find release-files -name "*.zip" -type f | sort | while read file; do
-            name=$(basename "$file")
-            size=$(du -h "$file" | cut -f1)
-            echo "- \`$name\` ($size)" >> $GITHUB_STEP_SUMMARY
-          done
-
-      - name: Cleanup
-        if: always()
-        run: |
-          rm -rf artifacts release-files release_notes.md
+          - **Packages:** ${{ steps.prepare.outputs.count }}
+          - **Total Size:** ${{ steps.prepare.outputs.size }}
+          - **Build Number:** #${{ github.run_number }}
+          - **Commit:** \`${{ github.sha }}\`
+          
+          ### 🔗 Quick Links
+          
+          - [📥 Download Release](https://github.com/${{ github.repository }}/releases/tag/${{ steps.prepare.outputs.tag }})
+          - [📋 Release Notes](https://github.com/${{ github.repository }}/releases/tag/${{ steps.prepare.outputs.tag }})
+          - [🔐 Checksums](https://github.com/${{ github.repository }}/releases/download/${{ steps.prepare.outputs.tag }}/SHA256SUMS.txt)
+          
+          ### 📦 Packages Included
+          
+          $(cd release && ls -1 *.zip | sed 's/^/- `/' | sed 's/$/`/')
+          
+          ### ⚙️ Build Configuration
+          
+          - **Hook:** ${{ inputs.HOOK }}
+          - **Optimization:** ${{ inputs.optimize_level }}
+          - **LSM:** ${{ inputs.LSM }}
+          - **SUSFS:** ${{ inputs.susfs_branch || 'auto' }}
+          EOF
