@@ -775,7 +775,6 @@ runs:
         WORK_DIR="$GITHUB_WORKSPACE/$MODEL"
         AK3_DIR="$GITHUB_WORKSPACE/AnyKernel3"
         
-        # Find Image
         image_path=$(find "$WORK_DIR/kernel_platform" -path "*/out/arch/arm64/boot/Image" -type f | head -n1)
         
         if [ -z "$image_path" ] || [ ! -f "$image_path" ]; then
@@ -788,22 +787,18 @@ runs:
         cp "$image_path" "$AK3_DIR/Image"
         
         PACKAGE_NAME="AnyKernel3_${MODEL}_${KANDROID_VERSION}-${TKERNEL_VERSION}_SukiSU_${KSUVER}"
-        ARTIFACT_NAME="kernel-${MODEL}-${BUILD_DATE}"  # ✅ NEW: Different artifact name
+        ARTIFACT_NAME="kernel-${MODEL}-${BUILD_DATE}"
         
         mkdir -p "$WORK_DIR/artifacts"
         
         cd "$AK3_DIR"
         
-        # Clean up
         rm -rf .git .github *.md *.txt 2>/dev/null || true
         
-        # Create zip
         echo "Creating package: ${PACKAGE_NAME}.zip"
         
-        # Build file list
         FILES="Image anykernel.sh tools/ META-INF/"
         
-        # Add SUSFS module if exists
         if [ -f "ksu_module_susfs_1.5.2+_CI.zip" ]; then
           FILES="$FILES ksu_module_susfs_1.5.2+_CI.zip"
           echo "Including SUSFS module"
@@ -828,11 +823,10 @@ runs:
         echo "✅ Package created: ${PKG_SIZE}MB"
         echo "Package location: $PKG_PATH"
         
-        # Output full path relative to workspace
         RELATIVE_PATH="${MODEL}/artifacts/${PACKAGE_NAME}.zip"
         
         printf "name=%s\n" "${PACKAGE_NAME}" >> "$GITHUB_OUTPUT"
-        printf "artifact_name=%s\n" "${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"  # ✅ NEW OUTPUT
+        printf "artifact_name=%s\n" "${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
         printf "size=%s\n" "${PKG_SIZE}" >> "$GITHUB_OUTPUT"
         printf "path=%s\n" "${RELATIVE_PATH}" >> "$GITHUB_OUTPUT"
         printf "filename=%s\n" "${PACKAGE_NAME}.zip" >> "$GITHUB_OUTPUT"
@@ -861,13 +855,11 @@ runs:
           exit 1
         fi
         
-        # Test zip integrity
         if ! unzip -t "$PKG_PATH" >/dev/null 2>&1; then
           echo "::error::Package is corrupted!"
           exit 1
         fi
         
-        # Verify Image is inside
         if ! unzip -l "$PKG_PATH" | grep -q "Image"; then
           echo "::error::Package missing kernel Image!"
           unzip -l "$PKG_PATH"
@@ -878,6 +870,25 @@ runs:
       env:
         MODEL: ${{ inputs.model }}
         PACKAGE_NAME: ${{ steps.package.outputs.name }}
+
+    - name: Save Version Info
+      shell: bash
+      run: |
+        mkdir -p "$GITHUB_WORKSPACE/version-info"
+        cat > "$GITHUB_WORKSPACE/version-info/${{ inputs.model }}.txt" << EOF
+        ${{ steps.stats.outputs.kernel_version }}
+        ${{ inputs.android_version }}
+        ${{ inputs.soc }}
+        EOF
+      env:
+        MODEL: ${{ inputs.model }}
+
+    - name: Upload Version Info
+      uses: actions/upload-artifact@v4
+      with:
+        name: version-${{ inputs.model }}
+        path: version-info/${{ inputs.model }}.txt
+        retention-days: 1
 
     - name: Generate Release Tag
       id: generate_tag
@@ -909,7 +920,7 @@ runs:
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ steps.package.outputs.artifact_name }}  # ✅ FIXED: Use new artifact name
+        name: ${{ steps.package.outputs.artifact_name }}
         path: ${{ steps.package.outputs.path }}
         compression-level: 0
         if-no-files-found: error
