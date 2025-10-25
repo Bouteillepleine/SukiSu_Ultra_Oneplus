@@ -439,8 +439,7 @@ jobs:
           1. Check the [workflow logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
           2. Verify the build artifacts were uploaded correctly
           3. Ensure GitHub token has proper permissions
-          4. Check for tag conflicts
-          
+                    
           ## 📋 Debug Information
           
           - **Device:** ${{ inputs.device }}
