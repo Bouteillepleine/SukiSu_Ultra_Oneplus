@@ -177,9 +177,6 @@ jobs:
           EOF
           fi
 
-      # ✅ REMOVED: Redundant upload (action already uploads)
-      # The composite action handles artifact upload internally
-
       - name: Upload Logs on Failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -208,53 +205,121 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-          pattern: AnyKernel3_*  # ✅ Only kernel packages
+          pattern: kernel-*  # ✅ Match new artifact naming pattern
           merge-multiple: false
 
-      - name: Verify Artifacts
+      - name: Extract and Flatten Artifacts
         run: |
-          echo "::group::Downloaded artifacts"
-          find artifacts -type f -name "*.zip" -ls
-          echo "::endgroup::"
+          set -euo pipefail
           
-          ZIP_COUNT=$(find artifacts -type f -name "*.zip" | wc -l)
+          echo "::group::Extracting artifacts"
+          
+          # Create flat directory for ZIPs
+          mkdir -p release
+          
+          # Find all kernel packages (they're in subdirectories)
+          find artifacts -type f -name "*.zip" | while read -r zip_path; do
+            filename=$(basename "$zip_path")
+            echo "Found: $filename"
+            
+            # Copy to release directory
+            cp "$zip_path" "release/$filename"
+          done
+          
+          cd release
+          
+          # Verify we have files
+          ZIP_COUNT=$(ls -1 *.zip 2>/dev/null | wc -l)
           
           if [ "$ZIP_COUNT" -eq 0 ]; then
             echo "::error::No kernel packages found!"
-            echo "Available artifacts:"
-            ls -lR artifacts/
+            echo "::group::Artifacts structure"
+            ls -lR ../artifacts/
+            echo "::endgroup::"
             exit 1
           fi
           
-          echo "Found $ZIP_COUNT kernel packages"
+          echo "✅ Extracted $ZIP_COUNT kernel packages"
+          ls -lh *.zip
+          
+          echo "::endgroup::"
+
+      - name: Verify Artifacts
+        run: |
+          cd release
+          
+          echo "::group::Verifying kernel packages"
+          
+          FAILED=0
+          
+          for zip in *.zip; do
+            echo "Checking $zip..."
+            
+            # Test ZIP integrity
+            if ! unzip -t "$zip" >/dev/null 2>&1; then
+              echo "::error::Corrupted ZIP: $zip"
+              FAILED=1
+              continue
+            fi
+            
+            # Verify kernel Image exists
+            if ! unzip -l "$zip" | grep -q "^.*Image$"; then
+              echo "::error::Missing kernel Image in $zip"
+              echo "::group::Contents of $zip"
+              unzip -l "$zip"
+              echo "::endgroup::"
+              FAILED=1
+              continue
+            fi
+            
+            # Check for nested ZIPs (should not exist after fix)
+            if unzip -l "$zip" | grep -q "\.zip$"; then
+              echo "::warning::Nested ZIP detected in $zip"
+              echo "::group::Nested content"
+              unzip -l "$zip" | grep "\.zip$"
+              echo "::endgroup::"
+            fi
+            
+            # Verify anykernel.sh exists
+            if ! unzip -l "$zip" | grep -q "anykernel.sh"; then
+              echo "::error::Missing anykernel.sh in $zip"
+              FAILED=1
+              continue
+            fi
+            
+            echo "✅ $zip verified"
+          done
+          
+          echo "::endgroup::"
+          
+          if [ "$FAILED" -ne 0 ]; then
+            echo "::error::Some packages failed verification!"
+            exit 1
+          fi
+          
+          echo "✅ All $ZIP_COUNT packages verified successfully"
 
       - name: Prepare Release
         id: prepare
         run: |
           set -euo pipefail
           
+          cd release
+          
           # Generate tag
           TAG="v1.5.12-r$(($(git tag -l "v1.5.12-r*" 2>/dev/null | wc -l) + 1))"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           
-          # Prepare release directory
-          mkdir -p release
-          
-          # Copy all kernel packages (each in its own subdirectory)
-          find artifacts -type f -name "*.zip" -exec cp {} release/ \;
-          
-          cd release
-          
-          # Count artifacts
+          # Count packages
           COUNT=$(ls -1 *.zip 2>/dev/null | wc -l)
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
           
           if [ "$COUNT" -eq 0 ]; then
-            echo "::error::No build artifacts found after copy!"
+            echo "::error::No packages found for release!"
             exit 1
           fi
           
-          echo "Prepared $COUNT kernel packages for release"
+          echo "✅ Prepared $COUNT kernel packages for release"
           
           # Generate checksums
           sha256sum *.zip | tee SHA256SUMS.txt
@@ -263,9 +328,12 @@ jobs:
           TOTAL_SIZE=$(du -sh . | awk '{print $1}')
           echo "size=$TOTAL_SIZE" >> "$GITHUB_OUTPUT"
           
-          # List packages
+          # List packages with details
           echo "::group::Release packages"
           ls -lh *.zip
+          echo ""
+          echo "SHA256 Checksums:"
+          cat SHA256SUMS.txt
           echo "::endgroup::"
 
       - name: Generate Release Notes
@@ -285,11 +353,12 @@ jobs:
           | **Total Size** | ${{ steps.prepare.outputs.size }} |
           | **Build Date** | `$(date -u '+%Y-%m-%d %H:%M:%S UTC')` |
           | **Commit** | `${{ github.sha }}` |
+          | **Build Number** | `#${{ github.run_number }}` |
           
           ## 📱 Supported Devices
           
           <details>
-          <summary>Click to expand device list</summary>
+          <summary>Click to expand device list (${{ steps.prepare.outputs.count }} devices)</summary>
           
           $(cd release && ls -1 *.zip | sed 's/AnyKernel3_//;s/_android[0-9]*-.*_SukiSU_.*\.zip//' | sort -u | awk '{print "- " $0}')
           
@@ -309,15 +378,26 @@ jobs:
           ## 📥 Installation
           
           1. Download the zip file for your device
-          2. Flask the AK3 file with  Kernel Flasher / SukiSu Manager
+          2. Flash the AK3 file with Kernel Flasher / SukiSU Manager
           3. Reboot and enjoy!
           
           ## ⚠️ Notes
           
-          - Backup your data before flashing
-          - This is a pre-release build for testing        
+          - **Backup your data** before flashing
+          - This is a pre-release build for testing
+          - Report issues on [GitHub Issues](https://github.com/${{ github.repository }}/issues)
           
-          ---          
+          ## 🔧 Build Configuration
+          
+          - **Compiler Optimization:** ${{ inputs.optimize_level }}
+          - **Hook Method:** ${{ inputs.HOOK }}
+          - **Baseband Guard (LSM):** ${{ inputs.LSM && 'Enabled' || 'Disabled' }}
+          - **SUSFS Branch:** ${{ inputs.susfs_branch || 'Auto-detected' }}
+          - **KSU Metadata:** ${{ inputs.KSU_META }}
+          
+          ---
+          
+          **Built with ❤️ by GitHub Actions**
           
           EOF
 
@@ -334,33 +414,58 @@ jobs:
         run: |
           cd release
           
-          # Verify files exist
-          if [ ! -f SHA256SUMS.txt ] || [ ! -f RELEASE_NOTES.md ]; then
-            echo "::error::Missing required files!"
+          # Verify required files exist
+          if [ ! -f SHA256SUMS.txt ]; then
+            echo "::error::Missing SHA256SUMS.txt!"
             ls -la
             exit 1
           fi
           
+          if [ ! -f RELEASE_NOTES.md ]; then
+            echo "::error::Missing RELEASE_NOTES.md!"
+            ls -la
+            exit 1
+          fi
+          
+          # Count ZIPs
+          ZIP_COUNT=$(ls -1 *.zip 2>/dev/null | wc -l)
+          if [ "$ZIP_COUNT" -eq 0 ]; then
+            echo "::error::No kernel packages to release!"
+            exit 1
+          fi
+          
+          echo "Creating release with $ZIP_COUNT packages..."
+          
           # Create release with all files
           gh release create "${{ steps.prepare.outputs.tag }}" \
-            --title "Build ${{ steps.prepare.outputs.tag }}" \
+            --title "OnePlus Kernels ${{ steps.prepare.outputs.tag }} ($ZIP_COUNT devices)" \
             --notes-file RELEASE_NOTES.md \
             --prerelease \
             *.zip SHA256SUMS.txt
+          
+          echo "✅ Release created successfully!"
 
       - name: Cleanup Old Releases
         if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          echo "::group::Cleaning up old releases"
+          
           # Keep only last 5 pre-releases
-          gh release list --limit 100 --json tagName,isPrerelease \
-            --jq '.[] | select(.isPrerelease) | .tagName' | \
-            tail -n +6 | \
-            while read tag; do
+          OLD_RELEASES=$(gh release list --limit 100 --json tagName,isPrerelease \
+            --jq '.[] | select(.isPrerelease) | .tagName' | tail -n +6)
+          
+          if [ -z "$OLD_RELEASES" ]; then
+            echo "No old releases to clean up"
+          else
+            echo "$OLD_RELEASES" | while read tag; do
               echo "Deleting old release: $tag"
-              gh release delete "$tag" --yes --cleanup-tag || true
+              gh release delete "$tag" --yes --cleanup-tag || echo "Failed to delete $tag"
             done
+          fi
+          
+          echo "::endgroup::"
 
       - name: Release Summary
         if: success()
@@ -370,11 +475,27 @@ jobs:
           
           ## Release: [${{ steps.prepare.outputs.tag }}](https://github.com/${{ github.repository }}/releases/tag/${{ steps.prepare.outputs.tag }})
           
+          ### 📊 Statistics
+          
           - **Packages:** ${{ steps.prepare.outputs.count }}
           - **Total Size:** ${{ steps.prepare.outputs.size }}
-          - **Download:** [Release Page](https://github.com/${{ github.repository }}/releases/tag/${{ steps.prepare.outputs.tag }})
+          - **Build Number:** #${{ github.run_number }}
+          - **Commit:** \`${{ github.sha }}\`
           
-          ## 📦 Packages Included
+          ### 🔗 Quick Links
+          
+          - [📥 Download Release](https://github.com/${{ github.repository }}/releases/tag/${{ steps.prepare.outputs.tag }})
+          - [📋 Release Notes](https://github.com/${{ github.repository }}/releases/tag/${{ steps.prepare.outputs.tag }})
+          - [🔐 Checksums](https://github.com/${{ github.repository }}/releases/download/${{ steps.prepare.outputs.tag }}/SHA256SUMS.txt)
+          
+          ### 📦 Packages Included
           
           $(cd release && ls -1 *.zip | sed 's/^/- `/' | sed 's/$/`/')
+          
+          ### ⚙️ Build Configuration
+          
+          - **Hook:** ${{ inputs.HOOK }}
+          - **Optimization:** ${{ inputs.optimize_level }}
+          - **LSM:** ${{ inputs.LSM }}
+          - **SUSFS:** ${{ inputs.susfs_branch || 'auto' }}
           EOF
