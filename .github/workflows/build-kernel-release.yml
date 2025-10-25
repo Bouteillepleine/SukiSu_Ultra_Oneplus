@@ -137,6 +137,7 @@ jobs:
           - **Kernel:** \`${{ steps.build.outputs.kernel_version }}\`
           - **KSU:** \`${{ steps.build.outputs.ksu_version }}\`
           - **Size:** \`${{ steps.build.outputs.package_size }}MB\`
+          - **Artifact:** \`${{ steps.build.outputs.artifact_name }}\`
           EOF
 
       - name: Upload Logs on Failure
@@ -165,28 +166,70 @@ jobs:
       - name: Download Artifact
         uses: actions/download-artifact@v4
         with:
-          pattern: AnyKernel3_*
-          path: release
-          merge-multiple: true
+          pattern: kernel-*  # ✅ FIXED: Matches composite action's artifact name
+          path: artifacts
+          merge-multiple: false
+
+      - name: Extract Package
+        run: |
+          set -euo pipefail
+          
+          echo "::group::Extracting package"
+          
+          mkdir -p release
+          
+          # Find the ZIP file (it's in a subdirectory)
+          ZIP_PATH=$(find artifacts -type f -name "*.zip" | head -n1)
+          
+          if [ -z "$ZIP_PATH" ]; then
+            echo "::error::No package found in artifacts"
+            echo "::group::Artifacts structure"
+            ls -lR artifacts/
+            echo "::endgroup::"
+            exit 1
+          fi
+          
+          echo "Found package: $ZIP_PATH"
+          cp "$ZIP_PATH" release/
+          
+          cd release
+          ZIP_FILE=$(basename "$ZIP_PATH")
+          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
+          
+          echo "✅ Extracted: $ZIP_FILE"
+          ls -lh "$ZIP_FILE"
+          
+          echo "::endgroup::"
 
       - name: Verify Package
         id: verify
         run: |
           cd release
           
-          ZIP=$(ls *.zip 2>/dev/null | head -n1)
+          ZIP="$ZIP_FILE"
           
-          if [ -z "$ZIP" ]; then
-            echo "::error::No package found"
+          if [ ! -f "$ZIP" ]; then
+            echo "::error::Package not found: $ZIP"
             ls -la
             exit 1
           fi
           
+          echo "::group::Verifying package"
+          
+          # Test ZIP integrity
           if ! unzip -t "$ZIP" >/dev/null 2>&1; then
             echo "::error::Corrupted package"
             exit 1
           fi
           
+          # Verify kernel Image exists
+          if ! unzip -l "$ZIP" | grep -q "Image"; then
+            echo "::error::Missing kernel Image"
+            unzip -l "$ZIP"
+            exit 1
+          fi
+          
+          # Calculate stats
           SIZE=$(($(stat -c%s "$ZIP" 2>/dev/null || stat -f%z "$ZIP") / 1024 / 1024))
           SHA256=$(sha256sum "$ZIP" | cut -d' ' -f1)
           
@@ -195,6 +238,12 @@ jobs:
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
           echo "size=$SIZE" >> "$GITHUB_OUTPUT"
           echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+          
+          echo "✅ Package verified"
+          echo "  Size: ${SIZE}MB"
+          echo "  SHA256: $SHA256"
+          
+          echo "::endgroup::"
 
       - name: Generate Tag
         id: tag
@@ -214,14 +263,20 @@ jobs:
           **SHA256:** `${{ steps.verify.outputs.sha256 }}`
           
           ## Installation
-          1. Download AK3 file       
-          3. Flash with Kernel Flasher/SukiSu Manager
-          3. Reboot
+          1. Download the AK3 file
+          2. Flash with Kernel Flasher / SukiSU Manager
+          3. Reboot and enjoy!
           
           ## Configuration
-          - Hook: `${{ inputs.HOOK }}`
-          - Optimization: `${{ inputs.optimize_level }}`
-          - LSM: `${{ inputs.LSM }}`
+          - **Hook:** `${{ inputs.HOOK }}`
+          - **Optimization:** `${{ inputs.optimize_level }}`
+          - **LSM:** `${{ inputs.LSM }}`
+          - **SUSFS Branch:** `${{ inputs.susfs_branch || 'auto' }}`
+          
+          ## Verification
+          ```bash
+          sha256sum -c SHA256SUMS.txt
+          ```
           EOF
 
       - name: Create Release
@@ -236,28 +291,60 @@ jobs:
           git push origin "${{ steps.tag.outputs.tag }}"
           
           gh release create "${{ steps.tag.outputs.tag }}" \
-            --title "${{ inputs.device }}" \
+            --title "${{ inputs.device }} - ${{ steps.tag.outputs.tag }}" \
             --notes-file NOTES.md \
             --prerelease \
             *.zip SHA256SUMS.txt
+          
+          echo "✅ Release created: ${{ steps.tag.outputs.tag }}"
 
       - name: Cleanup Old Releases
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release list --limit 50 --json tagName \
+          echo "::group::Cleaning up old releases"
+          
+          # Keep only last 5 releases for this device
+          OLD_RELEASES=$(gh release list --limit 50 --json tagName \
             --jq '.[] | select(.tagName | contains("${{ inputs.device }}")) | .tagName' | \
-            tail -n +6 | \
-            xargs -I {} gh release delete {} --yes --cleanup-tag 2>/dev/null || true
+            tail -n +6)
+          
+          if [ -z "$OLD_RELEASES" ]; then
+            echo "No old releases to clean up"
+          else
+            echo "$OLD_RELEASES" | while read tag; do
+              echo "Deleting: $tag"
+              gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+            done
+          fi
+          
+          echo "::endgroup::"
 
       - name: Summary
         if: success()
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" << EOF
-          # 🎉 Release Created
+          # 🎉 Release Created Successfully!
           
-          **Tag:** [\`${{ steps.tag.outputs.tag }}\`](https://github.com/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }})  
-          **Package:** \`${{ steps.verify.outputs.zip }}\` (${{ steps.verify.outputs.size }}MB)  
-          **SHA256:** \`${{ steps.verify.outputs.sha256 }}\`
+          ## Release: [${{ steps.tag.outputs.tag }}](https://github.com/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }})
+          
+          ### 📦 Package Details
+          
+          - **Device:** \`${{ inputs.device }}\`
+          - **Package:** \`${{ steps.verify.outputs.zip }}\`
+          - **Size:** ${{ steps.verify.outputs.size }}MB
+          - **SHA256:** \`${{ steps.verify.outputs.sha256 }}\`
+          
+          ### 🔗 Quick Links
+          
+          - [📥 Download Release](https://github.com/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }})
+          - [🔐 Verify Checksum](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/SHA256SUMS.txt)
+          
+          ### ⚙️ Build Configuration
+          
+          - **Hook:** ${{ inputs.HOOK }}
+          - **Optimization:** ${{ inputs.optimize_level }}
+          - **LSM:** ${{ inputs.LSM }}
+          - **SUSFS:** ${{ inputs.susfs_branch || 'auto' }}
           EOF
