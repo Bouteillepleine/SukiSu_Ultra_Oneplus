@@ -75,9 +75,6 @@ outputs:
   filename:
     description: 'Package filename (with .zip)'
     value: ${{ steps.package.outputs.filename }}
-  release_tag:
-    description: 'Release tag name'
-    value: ${{ steps.generate_tag.outputs.tag }}
 
 runs:
   using: composite
@@ -88,6 +85,7 @@ runs:
         set -euo pipefail
         echo "::group::Validate inputs"
         
+        # Check required inputs
         for var in MODEL SOC BRANCH MANIFEST ANDROID_VERSION KERNEL_VERSION OPTIMIZE_LEVEL; do
           val="${!var:-}"
           if [[ -z "$val" ]]; then
@@ -96,6 +94,7 @@ runs:
           fi
         done
         
+        # Validate formats
         if ! [[ "$SOC" =~ ^[A-Za-z0-9_-]+$ ]]; then
           echo "::error::soc contains invalid characters"
           exit 1
@@ -106,14 +105,16 @@ runs:
           exit 1
         fi
         
+        # Validate manifest
         if [[ "$MANIFEST" == http*://* ]]; then
           [[ "$MANIFEST" =~ ^https:// ]] || { echo "::error::Manifest must be HTTPS"; exit 1; }
-          [[ "$MANIFEST" =~ .xml($|?) ]] || { echo "::error::Manifest must be XML"; exit 1; }
+          [[ "$MANIFEST" =~ \.xml($|\?) ]] || { echo "::error::Manifest must be XML"; exit 1; }
         else
-          [[ "$MANIFEST" =~ .xml$ ]] || { echo "::error::Manifest must end with .xml"; exit 1; }
+          [[ "$MANIFEST" =~ \.xml$ ]] || { echo "::error::Manifest must end with .xml"; exit 1; }
           [[ ! "$MANIFEST" =~ [[:space:]] ]] || { echo "::error::Manifest cannot contain spaces"; exit 1; }
         fi
         
+        # Validate choices
         case "$OPTIMIZE_LEVEL" in
           O2|O3) ;;
           *) echo "::error::optimize_level must be O2 or O3"; exit 1 ;;
@@ -179,8 +180,8 @@ runs:
         set -euo pipefail
         REPO="/usr/local/bin/repo"
         if [ ! -x "$REPO" ]; then
-          curl -s https://storage.googleapis.com/git-repo-downloads/repo -o "$REPO"
-          chmod +x "$REPO"
+          sudo curl -s https://storage.googleapis.com/git-repo-downloads/repo -o "$REPO"
+          sudo chmod +x "$REPO"
         fi
         echo "REPO=$REPO" >> "$GITHUB_ENV"
 
@@ -208,12 +209,8 @@ runs:
           curl -Ls "$MANIFEST" -o "$GITHUB_WORKSPACE/.repo/manifests_fallback/${FILE_BASENAME}.xml"
           echo "FILE=${FILE_BASENAME}" >> "$GITHUB_ENV"
         else
-          FILE_BASENAME="$MANIFEST"
-          if [[ "$FILE_BASENAME" == *.xml ]]; then
-            echo "FILE=${FILE_BASENAME%.xml}" >> "$GITHUB_ENV"
-          else
-            echo "FILE=${FILE_BASENAME}" >> "$GITHUB_ENV"
-          fi
+          FILE_BASENAME="${MANIFEST%.xml}"
+          echo "FILE=${FILE_BASENAME}" >> "$GITHUB_ENV"
         fi
       env:
         MANIFEST: ${{ inputs.manifest }}
@@ -870,52 +867,6 @@ runs:
       env:
         MODEL: ${{ inputs.model }}
         PACKAGE_NAME: ${{ steps.package.outputs.name }}
-
-    - name: Save Version Info
-      shell: bash
-      run: |
-        mkdir -p "$GITHUB_WORKSPACE/version-info"
-        cat > "$GITHUB_WORKSPACE/version-info/${{ inputs.model }}.txt" << EOF
-        ${{ steps.stats.outputs.kernel_version }}
-        ${{ inputs.android_version }}
-        ${{ inputs.soc }}
-        EOF
-      env:
-        MODEL: ${{ inputs.model }}
-
-    - name: Upload Version Info
-      uses: actions/upload-artifact@v4
-      with:
-        name: version-${{ inputs.model }}
-        path: version-info/${{ inputs.model }}.txt
-        retention-days: 1
-
-    - name: Generate Release Tag
-      id: generate_tag
-      shell: bash
-      run: |
-        TAG="${MODEL}-${BUILD_DATE}"
-        printf "tag=%s\n" "${TAG}" >> "$GITHUB_OUTPUT"
-      env:
-        MODEL: ${{ inputs.model }}
-        BUILD_DATE: ${{ env.BUILD_DATE }}
-
-    - name: Generate Release Notes
-      shell: bash
-      run: |
-        cat > "$GITHUB_WORKSPACE/RELEASE_NOTES.md" << EOF
-        ## ${{ inputs.model }} - ${{ inputs.android_version }}
-        
-        **Kernel:** \`${{ steps.stats.outputs.kernel_version }}\`  
-        **KernelSU:** \`${{ env.KSUVER }}\`  
-        **SUSFS:** \`${{ env.SUSVER }}\`  
-        **Hook:** \`${{ env.HOOK_TYPE }}\`  
-        **Date:** \`${{ env.BUILD_DATE }}\`
-        
-        **SHA256:** \`${{ steps.stats.outputs.image_sha256 }}\`
-        
-        Flash via TWRP/OrangeFox recovery.
-        EOF
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
