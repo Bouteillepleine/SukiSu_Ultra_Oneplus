@@ -111,7 +111,7 @@ jobs:
 
       - name: Build Kernel
         id: build
-        uses: ./.github/actions/
+        uses: ./.github/actions/build-kernel
         with:
           model: ${{ steps.config.outputs.model }}
           soc: ${{ steps.config.outputs.soc }}
@@ -156,6 +156,8 @@ jobs:
     if: inputs.make_release && needs.build.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
@@ -166,11 +168,12 @@ jobs:
       - name: Download Artifact
         uses: actions/download-artifact@v4
         with:
-          pattern: kernel-*  # ✅ FIXED: Matches composite action's artifact name
+          pattern: kernel-*
           path: artifacts
           merge-multiple: false
 
       - name: Extract Package
+        id: extract
         run: |
           set -euo pipefail
           
@@ -178,7 +181,7 @@ jobs:
           
           mkdir -p release
           
-          # Find the ZIP file (it's in a subdirectory)
+          # Find the ZIP file (it's in a subdirectory named kernel-{model}-{date})
           ZIP_PATH=$(find artifacts -type f -name "*.zip" | head -n1)
           
           if [ -z "$ZIP_PATH" ]; then
@@ -194,7 +197,10 @@ jobs:
           
           cd release
           ZIP_FILE=$(basename "$ZIP_PATH")
-          echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
+          
+          # Output for next steps
+          echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+          echo "zip_path=release/$ZIP_FILE" >> "$GITHUB_OUTPUT"
           
           echo "✅ Extracted: $ZIP_FILE"
           ls -lh "$ZIP_FILE"
@@ -206,7 +212,7 @@ jobs:
         run: |
           cd release
           
-          ZIP="$ZIP_FILE"
+          ZIP="${{ steps.extract.outputs.zip_file }}"
           
           if [ ! -f "$ZIP" ]; then
             echo "::error::Package not found: $ZIP"
@@ -233,8 +239,10 @@ jobs:
           SIZE=$(($(stat -c%s "$ZIP" 2>/dev/null || stat -f%z "$ZIP") / 1024 / 1024))
           SHA256=$(sha256sum "$ZIP" | cut -d' ' -f1)
           
+          # Create checksum file
           echo "$SHA256  $ZIP" > SHA256SUMS.txt
           
+          # Output for next steps
           echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
           echo "size=$SIZE" >> "$GITHUB_OUTPUT"
           echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
@@ -249,34 +257,73 @@ jobs:
         id: tag
         run: |
           VERSION=$(cat .github/VERSION 2>/dev/null || echo "1.5.12")
-          TAG="v${VERSION}-${{ inputs.device }}-$(date +%Y%m%d-%H%M)"
+          TIMESTAMP=$(date +%Y%m%d-%H%M)
+          TAG="v${VERSION}-${{ inputs.device }}-${TIMESTAMP}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Generated tag: $TAG"
 
       - name: Create Release Notes
         run: |
           cd release
+          
           cat > NOTES.md << 'EOF'
-          # 🚀 ${{ inputs.device }} Kernel
+          # 🚀 ${{ inputs.device }} Kernel Build
           
-          **Package:** `${{ steps.verify.outputs.zip }}`  
-          **Size:** ${{ steps.verify.outputs.size }}MB  
-          **SHA256:** `${{ steps.verify.outputs.sha256 }}`
+          ## 📦 Package Information
           
-          ## Installation
-          1. Download the AK3 file
-          2. Flash with Kernel Flasher / SukiSU Manager
+          - **Filename:** `${{ steps.verify.outputs.zip }}`
+          - **Size:** ${{ steps.verify.outputs.size }} MB
+          - **SHA256:** `${{ steps.verify.outputs.sha256 }}`
+          
+          ## 📥 Installation
+          
+          1. Download the AnyKernel3 zip file
+          2. Flash via:
+             - **KernelSU Manager** (recommended)
+             - **Kernel Flasher**
+             - **TWRP/OrangeFox Recovery**
           3. Reboot and enjoy!
           
-          ## Configuration
-          - **Hook:** `${{ inputs.HOOK }}`
-          - **Optimization:** `${{ inputs.optimize_level }}`
-          - **LSM:** `${{ inputs.LSM }}`
-          - **SUSFS Branch:** `${{ inputs.susfs_branch || 'auto' }}`
+          ## ⚙️ Build Configuration
           
-          ## Verification
+          | Option | Value |
+          |--------|-------|
+          | Hook Type | `${{ inputs.HOOK }}` |
+          | Optimization | `${{ inputs.optimize_level }}` |
+          | Baseband Guard LSM | `${{ inputs.LSM }}` |
+          | SUSFS Branch | `${{ inputs.susfs_branch || 'auto-detected' }}` |
+          | KSU Metadata | `${{ inputs.KSU_META }}` |
+          
+          ## 🔐 Verification
+          
+          Verify package integrity:
           ```bash
           sha256sum -c SHA256SUMS.txt
           ```
+          
+          Expected output:
+          ```
+          ${{ steps.verify.outputs.zip }}: OK
+          ```
+          
+          ## ⚠️ Important Notes
+          
+          - ✅ Make sure to **backup your data** before flashing
+          - ✅ Verify your device model matches: **${{ inputs.device }}**
+          - ✅ Check that you have the correct recovery/flasher installed
+          - ✅ If you encounter issues, try clean flashing
+          
+          ## 🔗 Links
+          
+          - **KernelSU Manager:** https://github.com/tiann/KernelSU
+          - **Report Issues:** https://github.com/${{ github.repository }}/issues
+          - **Source Code:** https://github.com/${{ github.repository }}
+          
+          ---
+          
+          **Build Date:** `$(date -u +"%Y-%m-%d %H:%M UTC")`  
+          **Workflow:** `${{ github.workflow }}`  
+          **Run:** `#${{ github.run_number }}`
           EOF
 
       - name: Create Release
@@ -285,18 +332,26 @@ jobs:
         run: |
           cd release
           
+          # Configure git
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "${{ steps.tag.outputs.tag }}"
-          git push origin "${{ steps.tag.outputs.tag }}"
           
-          gh release create "${{ steps.tag.outputs.tag }}" \
-            --title "${{ inputs.device }} - ${{ steps.tag.outputs.tag }}" \
+          # Create and push tag
+          TAG="${{ steps.tag.outputs.tag }}"
+          git tag "$TAG"
+          git push origin "$TAG"
+          
+          # Create release
+          gh release create "$TAG" \
+            --title "🚀 ${{ inputs.device }} - $TAG" \
             --notes-file NOTES.md \
-            --prerelease \
-            *.zip SHA256SUMS.txt
+            --latest=false \
+            "${{ steps.verify.outputs.zip }}" \
+            SHA256SUMS.txt
           
-          echo "✅ Release created: ${{ steps.tag.outputs.tag }}"
+          echo "✅ Release created: $TAG"
+          echo "📦 Package: ${{ steps.verify.outputs.zip }}"
+          echo "🔗 URL: https://github.com/${{ github.repository }}/releases/tag/$TAG"
 
       - name: Cleanup Old Releases
         continue-on-error: true
@@ -306,45 +361,92 @@ jobs:
           echo "::group::Cleaning up old releases"
           
           # Keep only last 5 releases for this device
-          OLD_RELEASES=$(gh release list --limit 50 --json tagName \
-            --jq '.[] | select(.tagName | contains("${{ inputs.device }}")) | .tagName' | \
+          DEVICE_PATTERN="${{ inputs.device }}"
+          
+          OLD_RELEASES=$(gh release list --limit 100 --json tagName,createdAt \
+            --jq ".[] | select(.tagName | contains(\"$DEVICE_PATTERN\")) | .tagName" | \
             tail -n +6)
           
           if [ -z "$OLD_RELEASES" ]; then
-            echo "No old releases to clean up"
+            echo "ℹ️ No old releases to clean up"
           else
-            echo "$OLD_RELEASES" | while read tag; do
-              echo "Deleting: $tag"
-              gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
+            echo "🗑️ Deleting old releases:"
+            echo "$OLD_RELEASES" | while read -r tag; do
+              echo "  - $tag"
+              gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || \
+                echo "    ⚠️ Failed to delete $tag (may already be deleted)"
             done
           fi
           
           echo "::endgroup::"
 
-      - name: Summary
+      - name: Release Summary
         if: success()
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" << EOF
           # 🎉 Release Created Successfully!
           
-          ## Release: [${{ steps.tag.outputs.tag }}](https://github.com/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }})
+          ## 📦 Release Information
           
-          ### 📦 Package Details
+          **Tag:** [\`${{ steps.tag.outputs.tag }}\`](https://github.com/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }})
           
-          - **Device:** \`${{ inputs.device }}\`
-          - **Package:** \`${{ steps.verify.outputs.zip }}\`
-          - **Size:** ${{ steps.verify.outputs.size }}MB
-          - **SHA256:** \`${{ steps.verify.outputs.sha256 }}\`
+          ### Package Details
+          
+          | Property | Value |
+          |----------|-------|
+          | Device | \`${{ inputs.device }}\` |
+          | Filename | \`${{ steps.verify.outputs.zip }}\` |
+          | Size | ${{ steps.verify.outputs.size }} MB |
+          | SHA256 | \`${{ steps.verify.outputs.sha256 }}\` |
           
           ### 🔗 Quick Links
           
           - [📥 Download Release](https://github.com/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }})
           - [🔐 Verify Checksum](https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/SHA256SUMS.txt)
+          - [📖 Release Notes](https://github.com/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }})
           
           ### ⚙️ Build Configuration
           
-          - **Hook:** ${{ inputs.HOOK }}
-          - **Optimization:** ${{ inputs.optimize_level }}
-          - **LSM:** ${{ inputs.LSM }}
-          - **SUSFS:** ${{ inputs.susfs_branch || 'auto' }}
+          | Option | Value |
+          |--------|-------|
+          | Hook Type | \`${{ inputs.HOOK }}\` |
+          | Optimization | \`${{ inputs.optimize_level }}\` |
+          | Baseband Guard | \`${{ inputs.LSM }}\` |
+          | SUSFS Branch | \`${{ inputs.susfs_branch || 'auto' }}\` |
+          
+          ### 📊 Build Stats
+          
+          - **Workflow Run:** [#${{ github.run_number }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - **Commit:** [\`${{ github.sha }}\`](https://github.com/${{ github.repository }}/commit/${{ github.sha }})
+          - **Build Time:** $(date -u +"%Y-%m-%d %H:%M UTC")
+          
+          ---
+          
+          ✅ **Installation:** Flash via KernelSU Manager or Recovery  
+          🔐 **Verify:** \`sha256sum -c SHA256SUMS.txt\`
+          EOF
+
+      - name: Failure Summary
+        if: failure()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          # ❌ Release Failed
+          
+          The release creation process failed for **${{ inputs.device }}**.
+          
+          ## 🔍 Troubleshooting
+          
+          1. Check the [workflow logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          2. Verify the build artifacts were uploaded correctly
+          3. Ensure GitHub token has proper permissions
+          4. Check for tag conflicts
+          
+          ## 📋 Debug Information
+          
+          - **Device:** ${{ inputs.device }}
+          - **Tag:** ${{ steps.tag.outputs.tag }}
+          - **Workflow:** ${{ github.workflow }}
+          - **Run:** #${{ github.run_number }}
+          
+          Please review the logs and try again.
           EOF
