@@ -1,0 +1,263 @@
+name: Build OnePlus Kernel
+
+concurrency:
+  group: build-${{ github.ref }}-${{ inputs.device }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  actions: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: 'Device'
+        type: choice
+        required: true
+        options:
+          - oneplus_nord_4_v
+          - oneplus_ace_3v_v
+          - oneplus_11r_v
+          - oneplus_ace2_v
+          - oneplus_11_v
+          - oneplus_12r_v
+          - oneplus_ace2_pro_v
+          - oneplus_open_v
+          - oneplus12_v
+          - oneplus_ace3_pro_v
+          - oneplus_ace5
+          - oneplus_13r
+          - oneplus_nord_5
+          - oneplus_ace5_pro
+          - oneplus_13_CN
+          - oneplus_13_global
+          - oneplus_13t
+          - oneplus_13s
+          - oneplus_pad_3
+        default: oneplus_13_CN
+      make_release:
+        description: 'Create release?'
+        type: boolean
+        default: false
+      optimize_level:
+        description: 'Optimization'
+        type: choice
+        options: [O2, O3]
+        default: O2
+      KSU_META:
+        description: 'SukiSU Ultra metadata'
+        default: 'susfs-main/⚡Ultra⚡/'
+      HOOK:
+        description: 'Hook type'
+        type: choice
+        options: [kprobe, manual, tracepoint]
+        default: manual
+      LSM:
+        description: 'Enable Baseband Guard?'
+        type: boolean
+        default: false
+      susfs_branch:
+        description: 'SUSFS branch (auto if empty)'
+        default: ''
+
+jobs:
+  build:
+    name: Build ${{ inputs.device }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          swap-size-mb: 4096
+          remove-dotnet: true
+          remove-android: true
+          remove-haskell: true
+          remove-codeql: true
+          remove-docker-images: true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Environment
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -yqq jq
+
+      - name: Load Device Config
+        id: config
+        run: |
+          CONFIG_FILE=".github/device_map.json"
+          DEVICE="${{ inputs.device }}"
+          
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "::error::Config file not found"
+            exit 1
+          fi
+          
+          if ! jq -e --arg k "$DEVICE" 'has($k)' "$CONFIG_FILE" >/dev/null; then
+            echo "::error::Device '$DEVICE' not found"
+            jq -r 'keys[]' "$CONFIG_FILE"
+            exit 1
+          fi
+          
+          jq -r --arg k "$DEVICE" '.[$k] | to_entries[] | "\(.key)=\(.value)"' \
+            "$CONFIG_FILE" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Build Kernel
+        id: build
+        uses: ./.github/actions/
+        with:
+          model: ${{ steps.config.outputs.model }}
+          soc: ${{ steps.config.outputs.soc }}
+          branch: ${{ steps.config.outputs.branch }}
+          manifest: ${{ steps.config.outputs.manifest }}
+          android_version: ${{ steps.config.outputs.android_version }}
+          kernel_version: ${{ steps.config.outputs.kernel_version }}
+          susfs_branch: ${{ inputs.susfs_branch }}
+          KSU_META: ${{ inputs.KSU_META }}
+          HOOK: ${{ inputs.HOOK }}
+          LSM: ${{ inputs.LSM }}
+          optimize_level: ${{ inputs.optimize_level }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Summary
+        if: success()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## ✅ Build Success
+          
+          - **Device:** \`${{ inputs.device }}\`
+          - **Package:** \`${{ steps.build.outputs.package_name }}.zip\`
+          - **Kernel:** \`${{ steps.build.outputs.kernel_version }}\`
+          - **KSU:** \`${{ steps.build.outputs.ksu_version }}\`
+          - **Size:** \`${{ steps.build.outputs.package_size }}MB\`
+          EOF
+
+      - name: Upload Logs on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ inputs.device }}
+          path: |
+            ${{ steps.config.outputs.model }}/kernel_platform/common/build.log
+            ${{ steps.config.outputs.model }}/kernel_platform/common/out/.config
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    needs: build
+    if: inputs.make_release && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: AnyKernel3_*
+          path: release
+          merge-multiple: true
+
+      - name: Verify Package
+        id: verify
+        run: |
+          cd release
+          
+          ZIP=$(ls *.zip 2>/dev/null | head -n1)
+          
+          if [ -z "$ZIP" ]; then
+            echo "::error::No package found"
+            ls -la
+            exit 1
+          fi
+          
+          if ! unzip -t "$ZIP" >/dev/null 2>&1; then
+            echo "::error::Corrupted package"
+            exit 1
+          fi
+          
+          SIZE=$(($(stat -c%s "$ZIP" 2>/dev/null || stat -f%z "$ZIP") / 1024 / 1024))
+          SHA256=$(sha256sum "$ZIP" | cut -d' ' -f1)
+          
+          echo "$SHA256  $ZIP" > SHA256SUMS.txt
+          
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Tag
+        id: tag
+        run: |
+          VERSION=$(cat .github/VERSION 2>/dev/null || echo "1.5.12")
+          TAG="v${VERSION}-${{ inputs.device }}-$(date +%Y%m%d-%H%M)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create Release Notes
+        run: |
+          cd release
+          cat > NOTES.md << 'EOF'
+          # 🚀 ${{ inputs.device }} Kernel
+          
+          **Package:** `${{ steps.verify.outputs.zip }}`  
+          **Size:** ${{ steps.verify.outputs.size }}MB  
+          **SHA256:** `${{ steps.verify.outputs.sha256 }}`
+          
+          ## Installation
+          1. Download AK3 file       
+          3. Flash with Kernel Flasher/SukiSu Manager
+          3. Reboot
+          
+          ## Configuration
+          - Hook: `${{ inputs.HOOK }}`
+          - Optimization: `${{ inputs.optimize_level }}`
+          - LSM: `${{ inputs.LSM }}`
+          EOF
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd release
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.tag.outputs.tag }}"
+          git push origin "${{ steps.tag.outputs.tag }}"
+          
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --title "${{ inputs.device }}" \
+            --notes-file NOTES.md \
+            --prerelease \
+            *.zip SHA256SUMS.txt
+
+      - name: Cleanup Old Releases
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release list --limit 50 --json tagName \
+            --jq '.[] | select(.tagName | contains("${{ inputs.device }}")) | .tagName' | \
+            tail -n +6 | \
+            xargs -I {} gh release delete {} --yes --cleanup-tag 2>/dev/null || true
+
+      - name: Summary
+        if: success()
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          # 🎉 Release Created
+          
+          **Tag:** [\`${{ steps.tag.outputs.tag }}\`](https://github.com/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }})  
+          **Package:** \`${{ steps.verify.outputs.zip }}\` (${{ steps.verify.outputs.size }}MB)  
+          **SHA256:** \`${{ steps.verify.outputs.sha256 }}\`
+          EOF
