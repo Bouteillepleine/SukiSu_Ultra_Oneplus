@@ -73,8 +73,7 @@ This repository provides GitHub Actions workflows to automatically build flashab
 ### 🚀 Installation
 
 1. Download the latest kernel ZIP for your device from [Releases](https://github.com/Bouteillepleine/Oneplus-Kernels-SukiSu/releases)
-2. Boot into custom recovery (TWRP/OrangeFox recommended)
-3. Flash the AnyKernel3 ZIP
+2. Flash the AnyKernel3 ZIP with KErnel Flasher / SukuSU MAnager
 4. Reboot and enjoy!
 
 > ⚠️ **Warning**: Always backup your data before flashing custom kernels. Ensure you have a working recovery and know how to restore your device.
@@ -101,7 +100,6 @@ cd Oneplus-Kernels-SukiSu
 ### 📋 Requirements
 
 - Unlocked bootloader
-- Custom recovery (TWRP/OrangeFox)
 - Compatible OnePlus device from the supported list
 - Basic knowledge of flashing custom kernels
 
@@ -193,9 +191,8 @@ This project follows the licensing of its upstream components. Please refer to i
 ### 🚀 安装步骤
 
 1. 从 [Releases](https://github.com/Bouteillepleine/Oneplus-Kernels-SukiSu/releases) 下载适合您设备的最新内核 ZIP
-2. 启动到第三方 Recovery(推荐 TWRP/OrangeFox)
-3. 刷入 AnyKernel3 ZIP 包
-4. 重启并享受!
+2. 刷入 AnyKernel3 ZIP 包
+3. 重启并享受!
 
 > ⚠️ **警告**:刷入自定义内核前请务必备份数据。确保您有可用的 Recovery 并知道如何恢复设备。
 
@@ -221,7 +218,6 @@ cd Oneplus-Kernels-SukiSu
 ### 📋 要求
 
 - 已解锁 Bootloader
-- 第三方 Recovery(TWRP/OrangeFox)
 - 支持列表中的兼容 OnePlus 设备
 - 刷入自定义内核的基础知识
 
