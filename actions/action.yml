@@ -63,6 +63,9 @@ outputs:
   package_name:
     description: 'Package filename (without .zip)'
     value: ${{ steps.package.outputs.name }}
+  artifact_name:
+    description: 'Artifact name (for download)'
+    value: ${{ steps.package.outputs.artifact_name }}
   package_size:
     description: 'Package size in MB'
     value: ${{ steps.package.outputs.size }}
@@ -785,6 +788,7 @@ runs:
         cp "$image_path" "$AK3_DIR/Image"
         
         PACKAGE_NAME="AnyKernel3_${MODEL}_${KANDROID_VERSION}-${TKERNEL_VERSION}_SukiSU_${KSUVER}"
+        ARTIFACT_NAME="kernel-${MODEL}-${BUILD_DATE}"  # ✅ NEW: Different artifact name
         
         mkdir -p "$WORK_DIR/artifacts"
         
@@ -828,6 +832,7 @@ runs:
         RELATIVE_PATH="${MODEL}/artifacts/${PACKAGE_NAME}.zip"
         
         printf "name=%s\n" "${PACKAGE_NAME}" >> "$GITHUB_OUTPUT"
+        printf "artifact_name=%s\n" "${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"  # ✅ NEW OUTPUT
         printf "size=%s\n" "${PKG_SIZE}" >> "$GITHUB_OUTPUT"
         printf "path=%s\n" "${RELATIVE_PATH}" >> "$GITHUB_OUTPUT"
         printf "filename=%s\n" "${PACKAGE_NAME}.zip" >> "$GITHUB_OUTPUT"
@@ -838,6 +843,7 @@ runs:
         KANDROID_VERSION: ${{ inputs.android_version }}
         TKERNEL_VERSION: ${{ env.TKERNEL_VERSION }}
         KSUVER: ${{ env.KSUVER }}
+        BUILD_DATE: ${{ env.BUILD_DATE }}
 
     - name: Verify Package
       shell: bash
@@ -903,7 +909,7 @@ runs:
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ steps.package.outputs.name }}
+        name: ${{ steps.package.outputs.artifact_name }}  # ✅ FIXED: Use new artifact name
         path: ${{ steps.package.outputs.path }}
         compression-level: 0
         if-no-files-found: error
@@ -919,6 +925,7 @@ runs:
           echo "- Kernel: \`${{ steps.stats.outputs.kernel_version }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- KSU: \`${{ env.KSUVER }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Package: \`${{ steps.package.outputs.name }}.zip\` (\`${{ steps.package.outputs.size }}MB\`)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Artifact: \`${{ steps.package.outputs.artifact_name }}\`" >> "$GITHUB_STEP_SUMMARY"
         else
           echo "❌ **${{ inputs.model }}** - Build Failed" >> "$GITHUB_STEP_SUMMARY"
         fi
