@@ -75,6 +75,9 @@ outputs:
   filename:
     description: 'Package filename (with .zip)'
     value: ${{ steps.package.outputs.filename }}
+  release_tag:
+    description: 'Release tag name'
+    value: ${{ steps.generate_tag.outputs.tag }}
 
 runs:
   using: composite
@@ -85,7 +88,6 @@ runs:
         set -euo pipefail
         echo "::group::Validate inputs"
         
-        # Check required inputs
         for var in MODEL SOC BRANCH MANIFEST ANDROID_VERSION KERNEL_VERSION OPTIMIZE_LEVEL; do
           val="${!var:-}"
           if [[ -z "$val" ]]; then
@@ -94,7 +96,6 @@ runs:
           fi
         done
         
-        # Validate formats
         if ! [[ "$SOC" =~ ^[A-Za-z0-9_-]+$ ]]; then
           echo "::error::soc contains invalid characters"
           exit 1
@@ -105,16 +106,14 @@ runs:
           exit 1
         fi
         
-        # Validate manifest
         if [[ "$MANIFEST" == http*://* ]]; then
           [[ "$MANIFEST" =~ ^https:// ]] || { echo "::error::Manifest must be HTTPS"; exit 1; }
-          [[ "$MANIFEST" =~ \.xml($|\?) ]] || { echo "::error::Manifest must be XML"; exit 1; }
+          [[ "$MANIFEST" =~ .xml($|?) ]] || { echo "::error::Manifest must be XML"; exit 1; }
         else
-          [[ "$MANIFEST" =~ \.xml$ ]] || { echo "::error::Manifest must end with .xml"; exit 1; }
+          [[ "$MANIFEST" =~ .xml$ ]] || { echo "::error::Manifest must end with .xml"; exit 1; }
           [[ ! "$MANIFEST" =~ [[:space:]] ]] || { echo "::error::Manifest cannot contain spaces"; exit 1; }
         fi
         
-        # Validate choices
         case "$OPTIMIZE_LEVEL" in
           O2|O3) ;;
           *) echo "::error::optimize_level must be O2 or O3"; exit 1 ;;
@@ -180,8 +179,8 @@ runs:
         set -euo pipefail
         REPO="/usr/local/bin/repo"
         if [ ! -x "$REPO" ]; then
-          sudo curl -s https://storage.googleapis.com/git-repo-downloads/repo -o "$REPO"
-          sudo chmod +x "$REPO"
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo -o "$REPO"
+          chmod +x "$REPO"
         fi
         echo "REPO=$REPO" >> "$GITHUB_ENV"
 
@@ -209,8 +208,12 @@ runs:
           curl -Ls "$MANIFEST" -o "$GITHUB_WORKSPACE/.repo/manifests_fallback/${FILE_BASENAME}.xml"
           echo "FILE=${FILE_BASENAME}" >> "$GITHUB_ENV"
         else
-          FILE_BASENAME="${MANIFEST%.xml}"
-          echo "FILE=${FILE_BASENAME}" >> "$GITHUB_ENV"
+          FILE_BASENAME="$MANIFEST"
+          if [[ "$FILE_BASENAME" == *.xml ]]; then
+            echo "FILE=${FILE_BASENAME%.xml}" >> "$GITHUB_ENV"
+          else
+            echo "FILE=${FILE_BASENAME}" >> "$GITHUB_ENV"
+          fi
         fi
       env:
         MANIFEST: ${{ inputs.manifest }}
@@ -772,6 +775,7 @@ runs:
         WORK_DIR="$GITHUB_WORKSPACE/$MODEL"
         AK3_DIR="$GITHUB_WORKSPACE/AnyKernel3"
         
+        # Find Image
         image_path=$(find "$WORK_DIR/kernel_platform" -path "*/out/arch/arm64/boot/Image" -type f | head -n1)
         
         if [ -z "$image_path" ] || [ ! -f "$image_path" ]; then
@@ -784,18 +788,22 @@ runs:
         cp "$image_path" "$AK3_DIR/Image"
         
         PACKAGE_NAME="AnyKernel3_${MODEL}_${KANDROID_VERSION}-${TKERNEL_VERSION}_SukiSU_${KSUVER}"
-        ARTIFACT_NAME="kernel-${MODEL}-${BUILD_DATE}"
+        ARTIFACT_NAME="kernel-${MODEL}-${BUILD_DATE}"  # ✅ NEW: Different artifact name
         
         mkdir -p "$WORK_DIR/artifacts"
         
         cd "$AK3_DIR"
         
+        # Clean up
         rm -rf .git .github *.md *.txt 2>/dev/null || true
         
+        # Create zip
         echo "Creating package: ${PACKAGE_NAME}.zip"
         
+        # Build file list
         FILES="Image anykernel.sh tools/ META-INF/"
         
+        # Add SUSFS module if exists
         if [ -f "ksu_module_susfs_1.5.2+_CI.zip" ]; then
           FILES="$FILES ksu_module_susfs_1.5.2+_CI.zip"
           echo "Including SUSFS module"
@@ -820,10 +828,11 @@ runs:
         echo "✅ Package created: ${PKG_SIZE}MB"
         echo "Package location: $PKG_PATH"
         
+        # Output full path relative to workspace
         RELATIVE_PATH="${MODEL}/artifacts/${PACKAGE_NAME}.zip"
         
         printf "name=%s\n" "${PACKAGE_NAME}" >> "$GITHUB_OUTPUT"
-        printf "artifact_name=%s\n" "${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
+        printf "artifact_name=%s\n" "${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"  # ✅ NEW OUTPUT
         printf "size=%s\n" "${PKG_SIZE}" >> "$GITHUB_OUTPUT"
         printf "path=%s\n" "${RELATIVE_PATH}" >> "$GITHUB_OUTPUT"
         printf "filename=%s\n" "${PACKAGE_NAME}.zip" >> "$GITHUB_OUTPUT"
@@ -852,11 +861,13 @@ runs:
           exit 1
         fi
         
+        # Test zip integrity
         if ! unzip -t "$PKG_PATH" >/dev/null 2>&1; then
           echo "::error::Package is corrupted!"
           exit 1
         fi
         
+        # Verify Image is inside
         if ! unzip -l "$PKG_PATH" | grep -q "Image"; then
           echo "::error::Package missing kernel Image!"
           unzip -l "$PKG_PATH"
@@ -868,10 +879,37 @@ runs:
         MODEL: ${{ inputs.model }}
         PACKAGE_NAME: ${{ steps.package.outputs.name }}
 
+    - name: Generate Release Tag
+      id: generate_tag
+      shell: bash
+      run: |
+        TAG="${MODEL}-${BUILD_DATE}"
+        printf "tag=%s\n" "${TAG}" >> "$GITHUB_OUTPUT"
+      env:
+        MODEL: ${{ inputs.model }}
+        BUILD_DATE: ${{ env.BUILD_DATE }}
+
+    - name: Generate Release Notes
+      shell: bash
+      run: |
+        cat > "$GITHUB_WORKSPACE/RELEASE_NOTES.md" << EOF
+        ## ${{ inputs.model }} - ${{ inputs.android_version }}
+        
+        **Kernel:** \`${{ steps.stats.outputs.kernel_version }}\`  
+        **KernelSU:** \`${{ env.KSUVER }}\`  
+        **SUSFS:** \`${{ env.SUSVER }}\`  
+        **Hook:** \`${{ env.HOOK_TYPE }}\`  
+        **Date:** \`${{ env.BUILD_DATE }}\`
+        
+        **SHA256:** \`${{ steps.stats.outputs.image_sha256 }}\`
+        
+        Flash via TWRP/OrangeFox recovery.
+        EOF
+
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ steps.package.outputs.artifact_name }}
+        name: ${{ steps.package.outputs.artifact_name }}  # ✅ FIXED: Use new artifact name
         path: ${{ steps.package.outputs.path }}
         compression-level: 0
         if-no-files-found: error
