@@ -19,10 +19,6 @@ inputs:
   kernel_version:
     description: 'Kernel version (e.g., 6.1)'
     required: true
-  ksun_branch:
-    description: 'KernelSU branch'
-    required: false
-    default: 'stable'
   susfs_branch:
     description: 'SUSFS branch (auto-resolved if empty)'
     required: false
@@ -88,6 +84,7 @@ runs:
         set -euo pipefail
         echo "::group::Validate inputs"
         
+        # Check required variables
         for var in MODEL SOC BRANCH MANIFEST ANDROID_VERSION KERNEL_VERSION OPTIMIZE_LEVEL; do
           val="${!var:-}"
           if [[ -z "$val" ]]; then
@@ -96,16 +93,19 @@ runs:
           fi
         done
         
+        # Validate SoC format
         if ! [[ "$SOC" =~ ^[A-Za-z0-9_-]+$ ]]; then
           echo "::error::soc contains invalid characters"
           exit 1
         fi
         
+        # Validate branch format
         if ! [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
           echo "::error::branch contains invalid characters"
           exit 1
         fi
         
+        # Validate manifest
         if [[ "$MANIFEST" == http*://* ]]; then
           [[ "$MANIFEST" =~ ^https:// ]] || { echo "::error::Manifest must be HTTPS"; exit 1; }
           [[ "$MANIFEST" =~ .xml($|?) ]] || { echo "::error::Manifest must be XML"; exit 1; }
@@ -114,16 +114,19 @@ runs:
           [[ ! "$MANIFEST" =~ [[:space:]] ]] || { echo "::error::Manifest cannot contain spaces"; exit 1; }
         fi
         
+        # Validate optimization level
         case "$OPTIMIZE_LEVEL" in
           O2|O3) ;;
           *) echo "::error::optimize_level must be O2 or O3"; exit 1 ;;
         esac
         
+        # Validate hook type
         case "$HOOK" in
           kprobe|manual|tracepoint) ;;
           *) echo "::error::Invalid hook type: $HOOK"; exit 1 ;;
         esac
         
+        # Validate LSM flag
         case "$LSM" in
           true|false) ;;
           *) echo "::error::LSM must be 'true' or 'false'"; exit 1 ;;
@@ -147,9 +150,10 @@ runs:
       run: |
         set -euo pipefail
         echo "KANDROID_VERSION=${{ inputs.android_version }}" >> "$GITHUB_ENV"
-        echo "KERNEL_VERSION=${{ inputs.kernel_version }}" >> "$GITHUB_ENV"
+        echo "INPUT_KERNEL_VERSION=${{ inputs.kernel_version }}" >> "$GITHUB_ENV"
         echo "CONFIG=${{ inputs.model }}" >> "$GITHUB_ENV"
         echo "BUILD_DATE=$(date -u +%Y%m%d)" >> "$GITHUB_ENV"
+        echo "MIN_IMAGE_SIZE_MB=10" >> "$GITHUB_ENV"
 
     - name: Install Dependencies
       shell: bash
@@ -280,7 +284,7 @@ runs:
         P=$(grep -m1 '^PATCHLEVEL *=' Makefile | awk '{print $3}' || echo "0")
         S=$(grep -m1 '^SUBLEVEL *=' Makefile | awk '{print $3}' || echo "0")
         
-        echo "TKERNEL_VERSION=$V.$P.$S" >> "$GITHUB_ENV"
+        echo "DETECTED_KERNEL_VERSION=$V.$P.$S" >> "$GITHUB_ENV"
         echo "Detected kernel version: $V.$P.$S"
       env:
         CONFIG: ${{ inputs.model }}
@@ -303,7 +307,7 @@ runs:
             ["android15-6.6"]="gki-android15-6.6"
           )
           
-          key="${KANDROID_VERSION}-${KERNEL_VERSION}"
+          key="${KANDROID_VERSION}-${INPUT_KERNEL_VERSION}"
           
           if [[ -z "${map[$key]+_}" ]]; then
             echo "::error::Unsupported Android/Kernel combo: $key"
@@ -318,7 +322,7 @@ runs:
       env:
         SUSFS_BRANCH_INPUT: ${{ inputs.susfs_branch }}
         KANDROID_VERSION: ${{ inputs.android_version }}
-        KERNEL_VERSION: ${{ inputs.kernel_version }}
+        INPUT_KERNEL_VERSION: ${{ inputs.kernel_version }}
 
     - name: Set Branding
       shell: bash
@@ -368,7 +372,7 @@ runs:
         
         cd kernel_platform
         
-        PATCH_FILE="50_add_susfs_in_gki-${KANDROID_VERSION}-${KERNEL_VERSION}.patch"
+        PATCH_FILE="50_add_susfs_in_gki-${KANDROID_VERSION}-${INPUT_KERNEL_VERSION}.patch"
         
         cp "../susfs4ksu/kernel_patches/$PATCH_FILE" ./common/
         cp -r ../susfs4ksu/kernel_patches/fs/* ./common/fs/
@@ -376,24 +380,27 @@ runs:
         
         cd ./common
         
-        GKI_V="${KANDROID_VERSION}-${KERNEL_VERSION}"
+        GKI_V="${KANDROID_VERSION}-${INPUT_KERNEL_VERSION}"
         SUBLEVEL=$(grep '^SUBLEVEL *=' Makefile | head -n1 | cut -d= -f2 | tr -d ' ' || echo "0")
         
+        # Apply legacy fix for Android 13 5.15 kernels with SUBLEVEL < 123
         if [ "$GKI_V" = "android13-5.15" ] && [ "$SUBLEVEL" -lt 123 ]; then
           curl -Lo fix_5.15.legacy.patch --retry 5 \
             https://raw.githubusercontent.com/Numbersf/Action-Build/SukiSU-Ultra/patches/fix_5.15.legacy
           patch -p1 < fix_5.15.legacy.patch
         fi
         
-        if [[ "$KERNEL_VERSION" = "6.6" ]]; then
+        # Special handling for kernel 6.6
+        if [[ "$INPUT_KERNEL_VERSION" = "6.6" ]]; then
           if ! grep -q 'common-modules/trusty' "$GITHUB_WORKSPACE/.repo/manifests_fallback/${FILE}.xml" 2>/dev/null; then
-            if [[ "$(printf '%s\n' "$TKERNEL_VERSION" "6.6.30" | sort -V | head -n1)" = "$TKERNEL_VERSION" ]]; then
+            if [[ "$(printf '%s\n' "$DETECTED_KERNEL_VERSION" "6.6.30" | sort -V | head -n1)" = "$DETECTED_KERNEL_VERSION" ]]; then
               sed -i 's/-32,12 +32,38/-32,11 +32,37/g' "$PATCH_FILE"
               sed -i '/#include <trace\/hooks\/fs.h>/d' "$PATCH_FILE"
             fi
           fi
         fi
         
+        # Apply SUSFS patch with fallback to 3-way merge
         if ! patch -p1 -F 3 --no-backup-if-mismatch < "$PATCH_FILE"; then
           git init >/dev/null 2>&1 || true
           git add -A
@@ -404,8 +411,8 @@ runs:
         CONFIG: ${{ inputs.model }}
         SUSFS_KERNEL_BRANCH: ${{ env.SUSFS_KERNEL_BRANCH }}
         KANDROID_VERSION: ${{ inputs.android_version }}
-        KERNEL_VERSION: ${{ inputs.kernel_version }}
-        TKERNEL_VERSION: ${{ env.TKERNEL_VERSION }}
+        INPUT_KERNEL_VERSION: ${{ inputs.kernel_version }}
+        DETECTED_KERNEL_VERSION: ${{ env.DETECTED_KERNEL_VERSION }}
         FILE: ${{ env.FILE }}
 
     - name: Upload Patch Rejects
@@ -429,6 +436,7 @@ runs:
     - name: Apply Hide Patches
       shell: bash
       run: |
+        set -euo pipefail
         cd "$CONFIG/kernel_platform/common"
         cp ../../SukiSU_patch/69_hide_stuff.patch ./
         patch -p1 -F 3 < 69_hide_stuff.patch
@@ -464,6 +472,7 @@ runs:
       if: ${{ inputs.LSM == 'true' }}
       shell: bash
       run: |
+        set -euo pipefail
         cd "$CONFIG/kernel_platform/common"
         
         curl -LSs https://raw.githubusercontent.com/vc-teahouse/Baseband-guard/main/setup.sh -o /tmp/bbg_setup.sh
@@ -614,10 +623,6 @@ runs:
         # Link Time Optimization
         CONFIG_LTO_CLANG_THIN=y
         CONFIG_LTO_CLANG=y    
-        # Compiler Optimizations
-        CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y
-        CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=n
-        CONFIG_OPTIMIZE_INLINING=y    
         # Linker Optimizations
         CONFIG_LD_DEAD_CODE_DATA_ELIMINATION=y    
         # Power Efficiency
@@ -633,12 +638,30 @@ runs:
         CONFIG_DEBUG_ATOMIC_SLEEP=n
         EOF
         
+        # Optimization level - set correctly based on input
+        if [ "$OPTIMIZE_LEVEL" = "O3" ]; then
+          cat >> "$CONFIG_FILE" << 'EOF'
+        # Compiler Optimizations - O3
+        CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=n
+        CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=y
+        CONFIG_OPTIMIZE_INLINING=y
+        EOF
+        else
+          cat >> "$CONFIG_FILE" << 'EOF'
+        # Compiler Optimizations - O2
+        CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y
+        CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE_O3=n
+        CONFIG_OPTIMIZE_INLINING=y
+        EOF
+        fi
+        
         # LSM (optional)
         [ "$LSM" = "true" ] && echo "CONFIG_BBG=y" >> "$CONFIG_FILE"
       env:
         CONFIG: ${{ inputs.model }}
         HOOK: ${{ inputs.HOOK }}
         LSM: ${{ inputs.LSM }}
+        OPTIMIZE_LEVEL: ${{ inputs.optimize_level }}
 
     - name: Add sched_ext (6.6)
       if: ${{ inputs.kernel_version == '6.6' }}
@@ -647,9 +670,22 @@ runs:
         set -euo pipefail
         cd "$CONFIG/kernel_platform"
         
-        git clone https://github.com/HanKuCha/sched_ext.git --depth=1
-        cp -r sched_ext/* ./common/kernel/sched/
-        rm -rf sched_ext/.git
+        # Clone sched_ext repository
+        if ! git clone https://github.com/HanKuCha/sched_ext.git --depth=1 2>&1; then
+          echo "::error::Failed to clone sched_ext repository"
+          exit 1
+        fi
+        
+        # Copy files (glob pattern excludes .git automatically)
+        if ! cp -r sched_ext/* ./common/kernel/sched/ 2>&1; then
+          echo "::error::Failed to copy sched_ext files"
+          exit 1
+        fi
+        
+        # Clean up entire cloned directory
+        rm -rf sched_ext
+        
+        echo "✅ sched_ext applied successfully"
       env:
         CONFIG: ${{ inputs.model }}
 
@@ -659,12 +695,12 @@ runs:
       run: |
         mkdir -p "$GITHUB_WORKSPACE/$CONFIG/artifacts"
         
-        printf "kernel_version=%s\n" "${TKERNEL_VERSION}" >> "$GITHUB_OUTPUT"
+        printf "kernel_version=%s\n" "${DETECTED_KERNEL_VERSION}" >> "$GITHUB_OUTPUT"
         printf "ksu_version=%s\n" "${KSUVER}" >> "$GITHUB_OUTPUT"
         printf "susfs_version=%s\n" "${SUSVER}" >> "$GITHUB_OUTPUT"
       env:
         CONFIG: ${{ inputs.model }}
-        TKERNEL_VERSION: ${{ env.TKERNEL_VERSION }}
+        DETECTED_KERNEL_VERSION: ${{ env.DETECTED_KERNEL_VERSION }}
         KSUVER: ${{ env.KSUVER }}
         SUSVER: ${{ env.SUSVER }}
 
@@ -676,6 +712,7 @@ runs:
         KP="$GITHUB_WORKSPACE/$CONFIG/kernel_platform"
         CLANG_FOUND=false
         
+        # Search for prebuilt clang
         for base in "$KP/prebuilts" "$KP/prebuilts-master"; do
           [ -d "$base/clang/host/linux-x86" ] || continue
           latest=$(ls -d "$base/clang/host/linux-x86/clang-r*/" 2>/dev/null | sort -V | tail -n1 || true)
@@ -686,6 +723,7 @@ runs:
           fi
         done
         
+        # Fallback to system clang
         if ! $CLANG_FOUND && command -v clang >/dev/null 2>&1; then
           CLANG_BIN="$(dirname "$(command -v clang)")"
           CLANG_FOUND=true
@@ -694,6 +732,7 @@ runs:
         [ "$CLANG_FOUND" = "false" ] && { echo "::error::No clang found"; exit 1; }
         
         echo "CLANG_BIN_PATH=$CLANG_BIN" >> "$GITHUB_ENV"
+        echo "Found clang at: $CLANG_BIN"
       env:
         CONFIG: ${{ inputs.model }}
 
@@ -706,9 +745,11 @@ runs:
         
         cd "$GITHUB_WORKSPACE/$CONFIG/kernel_platform/common"
         
+        # Disable SCM versioning
         : > .scmversion
         sed -i 's/scm_version="$(scm_version --short)"/scm_version=""/' scripts/setlocalversion
         
+        # Setup build environment
         export PYTHONWARNINGS="ignore:invalid escape sequence"
         export PATH="${CLANG_BIN_PATH}:$PATH"
         export LLVM=1 LLVM_IAS=1
@@ -716,6 +757,7 @@ runs:
         export CROSS_COMPILE=aarch64-linux-android-
         export CROSS_COMPILE_COMPAT=arm-linux-androideabi-
         
+        # Use LLVM tools if available
         if command -v llvm-ar >/dev/null 2>&1; then
           export AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
         fi
@@ -725,13 +767,16 @@ runs:
         OUT=out
         mkdir -p "$OUT"
         
+        # Generate base config
         make O="$OUT" gki_defconfig
         
+        # Apply custom localversion
         if [ -n "${CUSTOM_LOCALVERSION}" ]; then
           scripts/config --file "$OUT/.config" --set-str LOCALVERSION "${CUSTOM_LOCALVERSION}"
           scripts/config --file "$OUT/.config" -d LOCALVERSION_AUTO
         fi
-        # Disable KUnit and related test configs
+        
+        # Disable KUnit test configs to speed up build
         disable_list=(
           CONFIG_REGMAP_KUNIT
           CONFIG_INPUT_KUNIT_TEST
@@ -748,20 +793,20 @@ runs:
         for sym in "${disable_list[@]}"; do
           scripts/config --file "$OUT/.config" -d "$sym" || true
         done
-        if [ "$OPTIMIZE_LEVEL" = "O3" ]; then
-          scripts/config --file "$OUT/.config" -d CC_OPTIMIZE_FOR_PERFORMANCE
-          scripts/config --file "$OUT/.config" -e CC_OPTIMIZE_FOR_PERFORMANCE_O3
-          KCFLAGS_EXTRA="-O3"
-        else
-          KCFLAGS_EXTRA="-O2"
-        fi
         
+        # Regenerate config with all changes
         make O="$OUT" olddefconfig
         
-        KCFLAGS="-Wno-error -pipe -fno-stack-protector ${KCFLAGS_EXTRA}"
+        # Set compiler flags based on optimization level
+        if [ "$OPTIMIZE_LEVEL" = "O3" ]; then
+          KCFLAGS="-Wno-error -pipe -fno-stack-protector -O3"
+        else
+          KCFLAGS="-Wno-error -pipe -fno-stack-protector -O2"
+        fi
         
         echo "Starting build with $(nproc) threads..."
         
+        # Build kernel
         if ! make -j$(nproc) O="$OUT" KCFLAGS="$KCFLAGS" 2>&1 | tee build.log; then
           echo "::error::Build failed"
           echo "::group::Build log tail"
@@ -770,6 +815,7 @@ runs:
           exit 1
         fi
         
+        # Verify kernel image exists
         IMG="$OUT/arch/arm64/boot/Image"
         if [ ! -f "$IMG" ]; then
           echo "::error::Image not found after build"
@@ -777,10 +823,11 @@ runs:
           exit 1
         fi
         
+        # Check image size
         IMG_SIZE=$(($(stat -c%s "$IMG" 2>/dev/null || stat -f%z "$IMG") / 1024 / 1024))
         
-        if [ "$IMG_SIZE" -lt 10 ]; then
-          echo "::error::Image too small: ${IMG_SIZE}MB"
+        if [ "$IMG_SIZE" -lt "$MIN_IMAGE_SIZE_MB" ]; then
+          echo "::error::Image too small: ${IMG_SIZE}MB (minimum: ${MIN_IMAGE_SIZE_MB}MB)"
           exit 1
         fi
         
@@ -791,6 +838,7 @@ runs:
         CLANG_BIN_PATH: ${{ env.CLANG_BIN_PATH }}
         CUSTOM_LOCALVERSION: ${{ env.CUSTOM_LOCALVERSION }}
         OPTIMIZE_LEVEL: ${{ inputs.optimize_level }}
+        MIN_IMAGE_SIZE_MB: ${{ env.MIN_IMAGE_SIZE_MB }}
 
     - name: Collect Stats
       id: stats
@@ -805,12 +853,16 @@ runs:
           exit 1
         fi
         
+        # Calculate SHA256
         SHA256=$(sha256sum "$IMG" | awk '{print $1}')
         
-        KVER=$(make -s O=out kernelrelease 2>/dev/null || echo "${TKERNEL_VERSION}")
+        # Get kernel release version
+        KVER=$(make -s O=out kernelrelease 2>/dev/null || echo "${DETECTED_KERNEL_VERSION}")
         
+        # Calculate image size
         IMG_SIZE=$(($(stat -c%s "$IMG" 2>/dev/null || stat -f%z "$IMG") / 1024 / 1024))
         
+        # Output stats
         printf "image_sha256=%s\n" "${SHA256}" >> "$GITHUB_OUTPUT"
         printf "kernel_version=%s\n" "${KVER}" >> "$GITHUB_OUTPUT"
         printf "image_size=%s\n" "${IMG_SIZE}" >> "$GITHUB_OUTPUT"
@@ -821,18 +873,26 @@ runs:
         echo "  SHA256: $SHA256"
       env:
         CONFIG: ${{ inputs.model }}
-        TKERNEL_VERSION: ${{ env.TKERNEL_VERSION }}
+        DETECTED_KERNEL_VERSION: ${{ env.DETECTED_KERNEL_VERSION }}
 
     - name: Download SUSFS Module
       continue-on-error: true
       shell: bash
       run: |
-        LATEST_RUN_ID=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
-          "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/runs?status=success&per_page=50" | \
-          jq -r '.workflow_runs[] | select(.head_branch == "v1.5.2+") | .id' | head -n 1)
+        # Retry logic for fetching latest successful run
+        for attempt in {1..3}; do
+          LATEST_RUN_ID=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/runs?status=success&per_page=50" | \
+            jq -r '.workflow_runs[] | select(.head_branch == "v1.5.2+") | .id' | head -n 1)
+          
+          [ -n "$LATEST_RUN_ID" ] && break
+          echo "Attempt $attempt: No run ID found, retrying..."
+          sleep 10
+        done
         
-        [ -z "$LATEST_RUN_ID" ] && exit 0
+        [ -z "$LATEST_RUN_ID" ] && { echo "No successful run found after 3 attempts"; exit 0; }
         
+        # Get artifact download URL
         ARTIFACT_URL=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
           "https://api.github.com/repos/sidex15/susfs4ksu-module/actions/runs/$LATEST_RUN_ID/artifacts" | \
           jq -r '.artifacts[0].archive_download_url // empty')
@@ -841,6 +901,7 @@ runs:
           curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" \
             -o ksu_module_susfs_1.5.2+_CI.zip "$ARTIFACT_URL"
           cp ksu_module_susfs_1.5.2+_CI.zip ./AnyKernel3/
+          echo "✅ SUSFS module downloaded"
         fi
       env:
         GITHUB_TOKEN: ${{ inputs.github_token }}
@@ -855,7 +916,7 @@ runs:
         WORK_DIR="$GITHUB_WORKSPACE/$MODEL"
         AK3_DIR="$GITHUB_WORKSPACE/AnyKernel3"
         
-        # Find Image
+        # Find kernel Image
         image_path=$(find "$WORK_DIR/kernel_platform" -path "*/out/arch/arm64/boot/Image" -type f | head -n1)
         
         if [ -z "$image_path" ] || [ ! -f "$image_path" ]; then
@@ -867,32 +928,34 @@ runs:
         echo "Found Image: $image_path"
         cp "$image_path" "$AK3_DIR/Image"
         
-        PACKAGE_NAME="AnyKernel3_${MODEL}_${KANDROID_VERSION}-${TKERNEL_VERSION}_SukiSU_${KSUVER}"
-        ARTIFACT_NAME="kernel-${MODEL}-${BUILD_DATE}"  # ✅ NEW: Different artifact name
+        # Generate package names
+        PACKAGE_NAME="AnyKernel3_${MODEL}_${KANDROID_VERSION}-${DETECTED_KERNEL_VERSION}_SukiSU_${KSUVER}"
+        ARTIFACT_NAME="kernel-${MODEL}-${BUILD_DATE}"
         
         mkdir -p "$WORK_DIR/artifacts"
         
         cd "$AK3_DIR"
         
-        # Clean up
+        # Clean up unnecessary files
         rm -rf .git .github *.md *.txt 2>/dev/null || true
         
-        # Create zip
         echo "Creating package: ${PACKAGE_NAME}.zip"
         
-        # Build file list
-        FILES="Image anykernel.sh tools/ META-INF/"
+        # Create zip with explicit file list
+        zip -r9 "$WORK_DIR/artifacts/${PACKAGE_NAME}.zip" \
+          Image anykernel.sh tools/ META-INF/ \
+          -x "*.git/*" -x "*.github/*" 2>&1
         
         # Add SUSFS module if exists
         if [ -f "ksu_module_susfs_1.5.2+_CI.zip" ]; then
-          FILES="$FILES ksu_module_susfs_1.5.2+_CI.zip"
-          echo "Including SUSFS module"
-        fi
-        
-        if ! zip -r9 "$WORK_DIR/artifacts/${PACKAGE_NAME}.zip" $FILES \
-          -x "*.git/*" -x "*.github/*" 2>&1; then
-          echo "::error::Failed to create package"
-          exit 1
+          cd "$WORK_DIR/artifacts"
+          unzip -q "${PACKAGE_NAME}.zip" -d temp_extract
+          cp "$AK3_DIR/ksu_module_susfs_1.5.2+_CI.zip" temp_extract/
+          cd temp_extract
+          zip -r9 "../${PACKAGE_NAME}.zip" . -x "*.git/*" -x "*.github/*"
+          cd ..
+          rm -rf temp_extract
+          echo "✅ SUSFS module included in package"
         fi
         
         PKG_PATH="$WORK_DIR/artifacts/${PACKAGE_NAME}.zip"
@@ -908,11 +971,11 @@ runs:
         echo "✅ Package created: ${PKG_SIZE}MB"
         echo "Package location: $PKG_PATH"
         
-        # Output full path relative to workspace
+        # Output relative path
         RELATIVE_PATH="${MODEL}/artifacts/${PACKAGE_NAME}.zip"
         
         printf "name=%s\n" "${PACKAGE_NAME}" >> "$GITHUB_OUTPUT"
-        printf "artifact_name=%s\n" "${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"  # ✅ NEW OUTPUT
+        printf "artifact_name=%s\n" "${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
         printf "size=%s\n" "${PKG_SIZE}" >> "$GITHUB_OUTPUT"
         printf "path=%s\n" "${RELATIVE_PATH}" >> "$GITHUB_OUTPUT"
         printf "filename=%s\n" "${PACKAGE_NAME}.zip" >> "$GITHUB_OUTPUT"
@@ -921,7 +984,7 @@ runs:
       env:
         MODEL: ${{ inputs.model }}
         KANDROID_VERSION: ${{ inputs.android_version }}
-        TKERNEL_VERSION: ${{ env.TKERNEL_VERSION }}
+        DETECTED_KERNEL_VERSION: ${{ env.DETECTED_KERNEL_VERSION }}
         KSUVER: ${{ env.KSUVER }}
         BUILD_DATE: ${{ env.BUILD_DATE }}
 
@@ -979,6 +1042,7 @@ runs:
         **KernelSU:** \`${{ env.KSUVER }}\`  
         **SUSFS:** \`${{ env.SUSVER }}\`  
         **Hook:** \`${{ env.HOOK_TYPE }}\`  
+        **Optimization:** \`${{ inputs.optimize_level }}\`  
         **Date:** \`${{ env.BUILD_DATE }}\`
         
         **SHA256:** \`${{ steps.stats.outputs.image_sha256 }}\`
@@ -989,11 +1053,33 @@ runs:
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ steps.package.outputs.artifact_name }}  # ✅ FIXED: Use new artifact name
+        name: ${{ steps.package.outputs.artifact_name }}
         path: ${{ steps.package.outputs.path }}
         compression-level: 0
         if-no-files-found: error
         retention-days: 30
+
+    - name: Cleanup Temporary Files
+      if: always()
+      shell: bash
+      run: |
+        cd "$CONFIG/kernel_platform/common" 2>/dev/null || exit 0
+        rm -f build.log *.patch 2>/dev/null || true
+        
+        cd "$CONFIG" 2>/dev/null || exit 0
+        rm -rf susfs4ksu SukiSU_patch 2>/dev/null || true
+        
+        echo "✅ Temporary files cleaned up"
+      env:
+        CONFIG: ${{ inputs.model }}
+
+    - name: Cleanup Git Config
+      if: always()
+      shell: bash
+      run: |
+        git config --global --unset user.name || true
+        git config --global --unset user.email || true
+        git config --global --unset advice.detachedHead || true
 
     - name: Summary
       if: always()
@@ -1002,10 +1088,19 @@ runs:
         if [ "${{ steps.build.outcome }}" = "success" ]; then
           echo "✅ **${{ inputs.model }}** - Build Success" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Kernel: \`${{ steps.stats.outputs.kernel_version }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- KSU: \`${{ env.KSUVER }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Package: \`${{ steps.package.outputs.name }}.zip\` (\`${{ steps.package.outputs.size }}MB\`)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Artifact: \`${{ steps.package.outputs.artifact_name }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Kernel | \`${{ steps.stats.outputs.kernel_version }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| KSU | \`${{ env.KSUVER }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SUSFS | \`${{ env.SUSVER }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Hook | \`${{ env.HOOK_TYPE }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Optimization | \`${{ inputs.optimize_level }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Package | \`${{ steps.package.outputs.name }}.zip\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Size | \`${{ steps.package.outputs.size }}MB\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Artifact | \`${{ steps.package.outputs.artifact_name }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| SHA256 | \`${{ steps.stats.outputs.image_sha256 }}\` |" >> "$GITHUB_STEP_SUMMARY"
         else
           echo "❌ **${{ inputs.model }}** - Build Failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Check the logs above for error details." >> "$GITHUB_STEP_SUMMARY"
         fi
